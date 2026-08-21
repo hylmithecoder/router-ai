@@ -177,4 +177,4 @@ cd webui && bun run lint && bun run build
 
 ## License
 
-MIT OR Apache-2.0.
+MIT.
