@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+# Zig-based C compiler/linker wrapper for building the Rust musl static binary.
+#
+# cc-rs / cargo pass Rust-style target triples (e.g. --target=x86_64-unknown-linux-musl)
+# which Zig's `--target=` parser rejects. This wrapper rewrites them into Zig's
+# native triple form (e.g. x86_64-linux-musl) and delegates to `zig cc`.
+
+set -e
+
+out=()
+for arg in "$@"; do
+  case "$arg" in
+    --target=*)
+      t="${arg#--target=}"
+      # Rust triple -> Zig triple: drop the vendor segment (e.g. "unknown-").
+      t="$(printf '%s' "$t" | sed 's/^x86_64-unknown-/x86_64-/; s/^aarch64-unknown-/aarch64-/; s/^i686-unknown-/i686-/')"
+      out+=("-target" "$t")
+      ;;
+    *)
+      out+=("$arg")
+      ;;
+  esac
+done
+
+exec zig cc "${out[@]}"

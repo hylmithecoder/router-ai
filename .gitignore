@@ -1,0 +1,11 @@
+/target
+.env
+*.log
+.DS_Store
+
+# local database
+router.db
+
+# build output
+/dist
+IMPLEMENTATION_PLAN.md

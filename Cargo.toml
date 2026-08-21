@@ -1,0 +1,58 @@
+[package]
+name = "router_api_ai"
+version = "0.1.0"
+edition = "2024"
+authors = ["Your Name <you@example.com>"]
+description = "Base template for a scalable Rust backend built with Axum and Tokio."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-username/api_sapaai"
+
+[dependencies]
+# Async runtime. "full" enables all features so the template works out of the box.
+tokio = { version = "1.53.0", features = ["full"] }
+
+# Web framework built on top of Tower.
+axum = "0.8.9"
+
+# Tower middleware and service utilities.
+tower = "0.5.2"
+tower-http = { version = "0.6.2", features = ["trace", "timeout", "cors", "fs"] }
+
+# Serialization / deserialization.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+# Load `.env` files in development.
+dotenvy = "0.15"
+
+# Error handling helpers.
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Common domain types.
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+
+# HTTP client for proxying to upstream providers.
+# rustls-tls (bukan native-tls/openssl) agar binary bisa fully static.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+
+# SQLite storage.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Key hashing.
+sha2 = "0.10"
+
+# AEAD encryption for persisted upstream API keys.
+ring = "0.17.14"
+
+# Async stream helpers for SSE passthrough.
+futures = "0.3"
+
+[dev-dependencies]
+# ServiceExt::oneshot is useful for integration tests with Axum.
+tower = { version = "0.5.2", features = ["util"] }
