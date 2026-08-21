@@ -326,19 +326,19 @@ pub async fn toggle_provider(
     Ok(ApiResponse::message("provider updated"))
 }
 
-/// `POST /api/v1/admin/providers` — add an encrypted Groq key from the dashboard.
+/// `POST /api/v1/admin/providers` — add an encrypted Groq or NVIDIA key from the dashboard.
 pub async fn create_provider(
     State(state): State<AppState>,
     Json(payload): Json<CreateProviderRequest>,
 ) -> Result<(StatusCode, ApiResponse<CreateProviderResponse>), AppError> {
     let Some(kind) = ProviderKind::parse(&payload.kind) else {
         return Err(AppError::Validation(
-            "kind must be groq, opencode, codex, claude, or agy".to_string(),
+            "kind must be groq, nvidia, opencode, codex, claude, or agy".to_string(),
         ));
     };
-    if kind != ProviderKind::Groq {
+    if kind.is_cli() {
         return Err(AppError::Validation(
-            "local agent CLIs are detected automatically; dashboard creation is for Groq keys"
+            "local agent CLIs are detected automatically; dashboard creation is for HTTP keys (groq, nvidia)"
                 .to_string(),
         ));
     }
@@ -349,30 +349,40 @@ pub async fn create_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Validation("api_key is required".to_string()))?;
-    let base_url = payload
-        .base_url
-        .unwrap_or_else(|| state.config.router.groq_base_url.clone());
+    let default_base_url = match kind {
+        ProviderKind::Nvidia => state.config.router.nvidia_base_url.clone(),
+        _ => state.config.router.groq_base_url.clone(),
+    };
+    let base_url = payload.base_url.unwrap_or(default_base_url);
     let base_url = base_url.trim().trim_end_matches('/').to_string();
     if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
         return Err(AppError::Validation(
             "base_url must start with http:// or https://".to_string(),
         ));
     }
+    let default_model = match kind {
+        ProviderKind::Nvidia => "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning".to_string(),
+        _ => state.config.router.default_model.clone(),
+    };
     let model = payload
         .model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| state.config.router.default_model.clone());
-    let id = format!("groq-dashboard-{}", Uuid::new_v4().simple());
+        .unwrap_or(default_model);
+    let id = format!("{}-dashboard-{}", kind.as_str(), Uuid::new_v4().simple());
+    let default_label_prefix = match kind {
+        ProviderKind::Nvidia => "NVIDIA",
+        _ => "Groq",
+    };
     let name = payload
         .name
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("Groq {}", &id[id.len().saturating_sub(8)..]));
+        .unwrap_or_else(|| format!("{} {}", default_label_prefix, &id[id.len().saturating_sub(8)..]));
 
     state
         .db
         .insert_provider(
             &id,
-            "groq",
+            kind.as_str(),
             name.trim(),
             &base_url,
             Some(api_key),
@@ -390,7 +400,7 @@ pub async fn create_provider(
         StatusCode::CREATED,
         ApiResponse::success(CreateProviderResponse {
             id,
-            kind: "groq".to_string(),
+            kind: kind.as_str().to_string(),
             name: name.trim().to_string(),
             base_url,
             model,
@@ -455,4 +465,43 @@ pub async fn delete_provider(
     }
     state.router.remove_provider(&id).await;
     Ok(ApiResponse::message("provider deleted"))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DnsLookupQuery {
+    pub host: String,
+    pub server: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DnsLookupResponse {
+    pub host: String,
+    pub server: String,
+    pub ips: Vec<String>,
+    pub latency_ms: u128,
+}
+
+/// `GET /api/v1/admin/dns` — perform async DNS query (like `dig` in Rust).
+pub async fn dns_lookup(
+    Query(query): Query<DnsLookupQuery>,
+) -> Result<ApiResponse<DnsLookupResponse>, AppError> {
+    let host = query.host.trim();
+    if host.is_empty() {
+        return Err(AppError::Validation("host parameter is required".to_string()));
+    }
+    let server = query.server.as_deref().unwrap_or("1.1.1.1");
+    let started = std::time::Instant::now();
+
+    match crate::dns::resolve_domain_from_server(host, server).await {
+        Ok(ips) => {
+            let latency_ms = started.elapsed().as_millis();
+            Ok(ApiResponse::success(DnsLookupResponse {
+                host: host.to_string(),
+                server: server.to_string(),
+                ips: ips.into_iter().map(|ip| ip.to_string()).collect(),
+                latency_ms,
+            }))
+        }
+        Err(e) => Err(AppError::Validation(format!("DNS query failed: {e}"))),
+    }
 }

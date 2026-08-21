@@ -21,6 +21,7 @@
 pub mod ai;
 pub mod config;
 pub mod database;
+pub mod dns;
 pub mod error;
 pub mod handlers;
 pub mod middleware;

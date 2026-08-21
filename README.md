@@ -1,33 +1,32 @@
 # AI Router (Rust + Next.js)
 
-A personal AI router: an OpenAI-compatible gateway that fronts Groq (and any
+A personal AI router: an OpenAI-compatible gateway that fronts NVIDIA NIM, Groq (and any
 OpenAI-compatible provider) with API-key auth, per-key daily token quotas,
 automatic failover between providers, usage tracking in SQLite, and a Next.js
 dashboard to monitor everything.
 
-Built to power Discord automoderation later — but it is a general-purpose
-OpenAI-compatible endpoint you can point any client at.
+Detailed routing specifications and native library integration guides are documented in [docs/ROUTING_API.md](docs/ROUTING_API.md).
 
 ## Architecture
 
 ```
 ┌─────────────┐   OpenAI-compatible   ┌──────────────────────┐   fallback chain   ┌──────────────┐
-│ Discord bot │ ───────────────────▶ │  Rust AI Router       │ ─────────────────▶ │  Groq key 1  │
-│ / your app  │   POST /v1/chat/...  │  (axum + sqlite)      │   429/5xx/timeout │  Groq key 2  │
-└─────────────┘                      │  - auth (API keys)    │ ─────────────────▶ │ local agent │
-┌─────────────┐                      │  - quota enforcement  │                    │ CLIs        │
+│ Discord bot │ ───────────────────▶ │  Rust AI Router       │ ─────────────────▶ │  NVIDIA NIM  │
+│ / your app  │   POST /v1/chat/...  │  (axum + sqlite)      │   429/5xx/timeout │  Groq keys   │
+└─────────────┘                      │  - auth (API keys)    │ ─────────────────▶ │ local agent  │
+┌─────────────┐                      │  - quota enforcement  │                    │ CLIs         │
 │ Next.js     │ ───────────────────▶ │  - usage logging      │                    └──────────────┘
 │ dashboard   │   admin API          │  - provider failover  │
 └─────────────┘                      └──────────────────────┘
 ```
 
 - **Router API** (port 5790): `POST /v1/chat/completions` (JSON + SSE streaming),
-  `POST /api/v1/chat` (unified Groq/local-agent routing), and `GET /v1/models` —
+  `POST /api/v1/chat` (unified NVIDIA/Groq/local-agent routing), and `GET /v1/models` —
   protected by per-key bearer tokens with daily token quotas.
 - **Admin API** (same server): usage stats, request log, key management, provider
   health — protected by a master key.
 - **WebUI** (Next.js, port 3000): dashboard with quota gauge, 7-day chart,
-  request log, personal key management, encrypted Groq-key management, and
+  request log, personal key management, encrypted NVIDIA & Groq key management, and
   local agent binary status.
 
 ## Quick start
@@ -35,7 +34,7 @@ OpenAI-compatible endpoint you can point any client at.
 ```bash
 # 1. Configure the backend
 cp .env.example .env
-#    edit .env: ROUTER_MASTER_KEY=..., GROQ_API_KEYS=...
+#    edit .env: ROUTER_MASTER_KEY=..., NVIDIA_API_KEYS=..., GROQ_API_KEYS=...
 
 # 2. Dev mode: run the whole stack with one command
 make setup          # copy env templates + install webui deps (once)
@@ -74,24 +73,30 @@ self-contained) or falls back to `musl-gcc`; the target can be overridden with
 curl http://127.0.0.1:5790/health
 curl http://127.0.0.1:5790/health/ready
 
-# OpenAI-compatible chat completion (uses your API key)
+# OpenAI-compatible chat completion with NVIDIA Nemotron 30B Omni Reasoning
 curl http://127.0.0.1:5790/v1/chat/completions \
   -H "Authorization: Bearer sk-router-xxx" \
   -H "Content-Type: application/json" \
-  -d '{"model":"llama-3.3-70b-versatile","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning","messages":[{"role":"user","content":"hello"}]}'
+
+# OpenAI-compatible chat completion with NVIDIA Nemotron 550B MoE
+curl http://127.0.0.1:5790/v1/chat/completions \
+  -H "Authorization: Bearer sk-router-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nvidia/nemotron-3-ultra-550b-a55b","messages":[{"role":"user","content":"hello"}]}'
 
 # Streaming (SSE)
 curl -N http://127.0.0.1:5790/v1/chat/completions \
   -H "Authorization: Bearer sk-router-xxx" \
   -H "Content-Type: application/json" \
-  -d '{"model":"llama-3.3-70b-versatile","stream":true,"messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 
-# Unified routing. `provider` can be `auto`, `groq`, `opencode`, `codex`,
+# Unified routing. `provider` can be `auto`, `nvidia`, `groq`, `opencode`, `codex`,
 # `claude`, `agy`, or a concrete provider id. Omitting it uses `auto` here.
 curl http://127.0.0.1:5790/api/v1/chat \
   -H "Authorization: Bearer sk-router-xxx" \
   -H "Content-Type: application/json" \
-  -d '{"provider":"opencode","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"provider":"nvidia","model":"nvidia/nemotron-3-ultra-550b-a55b","messages":[{"role":"user","content":"hello"}]}'
 
 # List models
 curl http://127.0.0.1:5790/v1/models -H "Authorization: Bearer sk-router-xxx"
@@ -102,11 +107,11 @@ curl http://127.0.0.1:5790/api/v1/admin/usage/log?limit=50 -H "Authorization: Be
 curl http://127.0.0.1:5790/api/v1/admin/keys -H "Authorization: Bearer $ROUTER_MASTER_KEY"
 curl http://127.0.0.1:5790/api/v1/admin/providers -H "Authorization: Bearer $ROUTER_MASTER_KEY"
 
-# Add a Groq key. It is encrypted at rest and never returned by list endpoints.
+# Add an NVIDIA key. It is encrypted at rest and never returned by list endpoints.
 curl -X POST http://127.0.0.1:5790/api/v1/admin/providers \
   -H "Authorization: Bearer $ROUTER_MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"kind":"groq","name":"Groq #3","api_key":"gsk_..."}'
+  -d '{"kind":"nvidia","name":"NVIDIA Primary","api_key":"nvapi-..."}'
 ```
 
 Any OpenAI SDK works — just point `base_url` at `http://127.0.0.1:5790/v1`.
@@ -117,7 +122,9 @@ Any OpenAI SDK works — just point `base_url` at `http://127.0.0.1:5790/v1`.
 |---|---|---|
 | `ROUTER_MASTER_KEY` | *(required)* | Admin key for the dashboard and admin API |
 | `ROUTER_API_KEYS` | — | Personal keys seeded at startup (comma-separated) |
-| `GROQ_API_KEYS` | — | Upstream keys in fallback order. Optional per-key base URL: `key@https://.../v1` |
+| `NVIDIA_API_KEYS` | — | Upstream NVIDIA keys in fallback order. Optional per-key base URL: `key@https://.../v1` |
+| `ROUTER_NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Default NVIDIA NIM base URL |
+| `GROQ_API_KEYS` | — | Upstream Groq keys in fallback order. Optional per-key base URL: `key@https://.../v1` |
 | `ROUTER_GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Default upstream base URL |
 | `ROUTER_DEFAULT_MODEL` | `llama-3.3-70b-versatile` | Model served by the router |
 | `ROUTER_DB_PATH` | `router.db` | SQLite database file |
@@ -129,15 +136,11 @@ Any OpenAI SDK works — just point `base_url` at `http://127.0.0.1:5790/v1`.
 
 ## How failover works
 
-1. `/v1/chat/completions` tries Groq providers in the order listed in
-   `GROQ_API_KEYS`. `/api/v1/chat` defaults to `auto`, which includes persisted
-   Groq keys and locally discovered `opencode`, `codex`, `claude`, and `agy`
-   providers. Set `provider` to a concrete id/kind to select one backend.
-2. On `429` / `5xx` / timeout / network error, the provider enters cooldown
-   (skipped for `ROUTER_PROVIDER_COOLDOWN_SECS`) and the next selected provider is tried.
-3. Failures are counted in SQLite and shown on the dashboard Providers page,
-   where you can also enable/disable providers without restarting.
-4. If all providers fail, the request gets `503` and is logged as such.
+1. Requests specify a model or provider. Model names matching `nvidia/*` or `nemotron*` route to NVIDIA upstreams; `llama*`, `mixtral*`, or `groq/*` route to Groq upstreams; local agent aliases route to local CLIs.
+2. `/api/v1/chat` defaults to `auto`, which includes persisted NVIDIA & Groq keys and locally discovered `opencode`, `codex`, `claude`, and `agy` providers.
+3. On `429` / `5xx` / timeout / network error, the provider enters cooldown (skipped for `ROUTER_PROVIDER_COOLDOWN_SECS`) and the next selected provider is tried.
+4. Failures are counted in SQLite and shown on the dashboard Providers page, where you can also enable/disable providers without restarting.
+5. If all providers fail, the request gets `503` and is logged as such.
 
 ## Project layout (backend)
 

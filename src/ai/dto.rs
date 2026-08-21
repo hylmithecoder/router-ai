@@ -25,16 +25,201 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Optional reasoning / thinking configuration used by models like Google DiffusionGemma / Gemma-4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
     /// Optional router-level provider selector. It is accepted by the router
     /// but never forwarded to an upstream provider.
     #[serde(default, alias = "agent", skip_serializing)]
     pub provider: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl ChatCompletionRequest {
+    /// Returns true if any message in the request contains image content.
+    pub fn has_images(&self) -> bool {
+        self.messages.iter().any(|m| m.content.has_images())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatMessageContent,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<ChatMessageContent>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+        }
+    }
+
+    pub fn system(content: impl Into<ChatMessageContent>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<ChatMessageContent>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+        }
+    }
+}
+
+/// Message content supporting either a plain text string or multimodal parts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl ChatMessageContent {
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    if let ChatContentPart::Text { text } = part {
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str(text);
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text.as_str()),
+            Self::Parts(_) => None,
+        }
+    }
+
+    /// Returns true if this message content contains any image parts.
+    pub fn has_images(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ChatContentPart::ImageUrl { .. })),
+        }
+    }
+}
+
+impl From<&str> for ChatMessageContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl From<String> for ChatMessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<Vec<ChatContentPart>> for ChatMessageContent {
+    fn from(parts: Vec<ChatContentPart>) -> Self {
+        Self::Parts(parts)
+    }
+}
+
+/// Multimodal content part (text or image_url).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlDetail },
+}
+
+impl ChatContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Self::ImageUrl {
+            image_url: ImageUrlDetail {
+                url: url.into(),
+                detail: None,
+            },
+        }
+    }
+
+    pub fn image_url_with_detail(url: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::ImageUrl {
+            image_url: ImageUrlDetail {
+                url: url.into(),
+                detail: Some(detail.into()),
+            },
+        }
+    }
+}
+
+/// Image URL detail payload for multimodal vision models.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageUrlDetail {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `POST /api/v1/ocr/licenseplate` request payload.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LicensePlateOcrRequest {
+    /// Base64 string, data URL (e.g. data:image/jpeg;base64,...), or remote HTTP(S) image URL.
+    #[serde(alias = "image_url", alias = "image_base64")]
+    pub image: String,
+    /// Optional model override (defaults to `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` or configured vision provider).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional provider override (defaults to `nvidia` or `auto`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional additional instruction / prompt override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+}
+
+/// Structured vehicle license plate recognition result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LicensePlateData {
+    /// The recognized primary license plate number (e.g., "B 1234 ABC").
+    pub plate_number: String,
+    /// Vehicle type if identified (e.g., "car", "motorcycle", "truck", "bus", "unknown").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vehicle_type: Option<String>,
+    /// Confidence assessment ("high", "medium", "low").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Raw unformatted plate text or secondary lines (e.g. expiration date "05.28").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
+    /// Brief description of vehicle / context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Upstream model used for OCR.
+    pub model: String,
+    /// Upstream provider used for OCR.
+    pub provider: String,
+}
+
+/// Standard envelope for license plate OCR responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LicensePlateOcrResponse {
+    pub success: bool,
+    pub data: LicensePlateData,
+    #[serde(default)]
+    pub usage: Usage,
 }
 
 /// Non-streaming response.

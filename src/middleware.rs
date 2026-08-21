@@ -54,6 +54,112 @@ pub async fn request_id(req: Request<Body>, next: Next) -> Response {
     response
 }
 
+/// Detailed request and response logger that outputs full API payloads to the terminal.
+pub async fn http_logger(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+
+    // Skip verbose body logging for static Next.js assets to keep logs clean
+    let is_api_route = path.starts_with("/api/")
+        || path.starts_with("/v1/")
+        || path == "/health"
+        || path == "/health/ready";
+
+    if !is_api_route {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 5 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to buffer request body for logging");
+            return error_response(StatusCode::BAD_REQUEST, "invalid request body");
+        }
+    };
+
+    let req_body_str = if bytes.is_empty() {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+
+    let req_log = if req_body_str.is_empty() {
+        "(empty)".to_string()
+    } else {
+        truncate_log_string(&req_body_str, 1200)
+    };
+
+    println!("\n\x1b[1;36m[API REQUEST]\x1b[0m \x1b[1m{} {}\x1b[0m", method, uri);
+    if !req_body_str.is_empty() {
+        println!("\x1b[90m└── Body:\x1b[0m {}", req_log);
+    }
+
+    let req = Request::from_parts(parts, Body::from(bytes));
+    let started = std::time::Instant::now();
+    let res = next.run(req).await;
+    let elapsed = started.elapsed().as_millis();
+    let status = res.status();
+
+    let is_sse = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_sse {
+        println!(
+            "\x1b[1;32m[API RESPONSE]\x1b[0m \x1b[1m{} {}\x1b[0m -> \x1b[1;32m{}\x1b[0m (streaming SSE) \x1b[90m[{}ms]\x1b[0m",
+            method, path, status, elapsed
+        );
+        return res;
+    }
+
+    let (res_parts, res_body) = res.into_parts();
+    let res_bytes = match axum::body::to_bytes(res_body, 5 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to buffer response body for logging");
+            return Response::from_parts(res_parts, Body::empty());
+        }
+    };
+
+    let res_body_str = String::from_utf8_lossy(&res_bytes).to_string();
+    let res_log = if res_body_str.is_empty() {
+        "(empty)".to_string()
+    } else {
+        truncate_log_string(&res_body_str, 1200)
+    };
+
+    let status_color = if status.is_success() {
+        "\x1b[1;32m"
+    } else if status.is_client_error() {
+        "\x1b[1;33m"
+    } else {
+        "\x1b[1;31m"
+    };
+
+    println!(
+        "\x1b[1;35m[API RESPONSE]\x1b[0m \x1b[1m{} {}\x1b[0m -> {}{}\x1b[0m \x1b[90m[{}ms]\x1b[0m",
+        method, path, status_color, status, elapsed
+    );
+    if !res_body_str.is_empty() {
+        println!("\x1b[90m└── Body:\x1b[0m {}\n", res_log);
+    }
+
+    Response::from_parts(res_parts, Body::from(res_bytes))
+}
+
+fn truncate_log_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}... [truncated {} bytes]", &s[..max_len], s.len() - max_len)
+    }
+}
+
 fn bearer_token(req: &Request<Body>) -> Option<String> {
     req.headers()
         .get(AUTHORIZATION)?
@@ -82,6 +188,17 @@ pub async fn require_api_key(
     let Some(token) = bearer_token(&req) else {
         return error_response(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
+
+    // If the provided token is the master key, grant immediate admin access with unlimited quota
+    if token == state.config.router.master_key {
+        let mut req = req;
+        req.extensions_mut().insert(AuthKey {
+            id: "master".to_string(),
+            name: "master".to_string(),
+            quota_daily_tokens: 0,
+        });
+        return next.run(req).await;
+    }
 
     let record = match state.db.find_key_by_hash(&hash_key(&token)).await {
         Ok(Some(r)) => r,

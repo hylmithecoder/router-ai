@@ -209,7 +209,7 @@ fn sse_for_completed(response: &ChatCompletionResponse) -> String {
     let content = response
         .choices
         .first()
-        .map(|choice| choice.message.content.as_str())
+        .map(|choice| choice.message.content.as_text())
         .unwrap_or_default();
     let first = serde_json::json!({
         "id": response.id,

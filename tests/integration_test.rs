@@ -12,7 +12,10 @@ use axum::{
 };
 use router_api_ai::{
     ai::router::AiRouter,
-    config::{ApiKeySeed, AppSettings, GroqKeySpec, RouterSettings, ServerSettings, Settings},
+    config::{
+        ApiKeySeed, AppSettings, GroqKeySpec, NvidiaKeySpec, RouterSettings, ServerSettings,
+        Settings,
+    },
     database::Db,
     routes::create_router,
     state::AppState,
@@ -20,7 +23,11 @@ use router_api_ai::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-fn test_settings(master_key: &str, groq_keys: Vec<GroqKeySpec>) -> Settings {
+fn test_settings_full(
+    master_key: &str,
+    groq_keys: Vec<GroqKeySpec>,
+    nvidia_keys: Vec<NvidiaKeySpec>,
+) -> Settings {
     Settings {
         app: AppSettings {
             name: "test-router".to_string(),
@@ -37,6 +44,8 @@ fn test_settings(master_key: &str, groq_keys: Vec<GroqKeySpec>) -> Settings {
             }],
             groq_api_keys: groq_keys,
             groq_base_url: "http://127.0.0.1:1/v1".to_string(),
+            nvidia_api_keys: nvidia_keys,
+            nvidia_base_url: "http://127.0.0.1:1/v1".to_string(),
             default_model: "mock-model".to_string(),
             db_path: ":memory:".to_string(),
             static_dir: "/nonexistent-static-dir".to_string(),
@@ -49,7 +58,15 @@ fn test_settings(master_key: &str, groq_keys: Vec<GroqKeySpec>) -> Settings {
 }
 
 async fn test_app(master_key: &str, groq_keys: Vec<GroqKeySpec>) -> (axum::Router, AppState) {
-    let settings = test_settings(master_key, groq_keys);
+    test_app_full(master_key, groq_keys, vec![]).await
+}
+
+async fn test_app_full(
+    master_key: &str,
+    groq_keys: Vec<GroqKeySpec>,
+    nvidia_keys: Vec<NvidiaKeySpec>,
+) -> (axum::Router, AppState) {
+    let settings = test_settings_full(master_key, groq_keys, nvidia_keys);
     let db = Db::open_in_memory().await.unwrap();
     db.seed_api_keys(&settings.router.api_keys).await.unwrap();
     let router = AiRouter::new(&settings, db.clone()).await;
@@ -612,4 +629,584 @@ async fn streaming_routes_to_second_provider() {
             .failure_count,
         1
     );
+}
+
+#[tokio::test]
+async fn chat_completion_routes_to_nvidia_by_model() {
+    let mock_groq = spawn_mock(failing_upstream(StatusCode::INTERNAL_SERVER_ERROR)).await;
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, state) = test_app_full(
+        "master",
+        vec![GroqKeySpec {
+            key: "gk-1".into(),
+            base_url: mock_groq,
+        }],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    let (status, body) = chat_request(
+        &app,
+        json!({
+            "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "hello from mock");
+
+    let usage = state.db.usage_summary_today().await.unwrap();
+    assert_eq!(usage[0].total_tokens, 15);
+}
+
+#[tokio::test]
+async fn chat_completion_routes_to_nvidia_by_provider_selector() {
+    let mock_groq = spawn_mock(failing_upstream(StatusCode::INTERNAL_SERVER_ERROR)).await;
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![GroqKeySpec {
+            key: "gk-1".into(),
+            base_url: mock_groq,
+        }],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/chat")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "provider": "nvidia",
+                        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello from mock");
+}
+
+#[tokio::test]
+async fn falls_back_across_nvidia_keys() {
+    let bad_nvidia = spawn_mock(failing_upstream(StatusCode::TOO_MANY_REQUESTS)).await;
+    let good_nvidia = spawn_mock(success_upstream()).await;
+    let (app, state) = test_app_full(
+        "master",
+        vec![],
+        vec![
+            NvidiaKeySpec {
+                key: "nv-1".into(),
+                base_url: bad_nvidia,
+            },
+            NvidiaKeySpec {
+                key: "nv-2".into(),
+                base_url: good_nvidia,
+            },
+        ],
+    )
+    .await;
+
+    let (status, body) = chat_request(
+        &app,
+        json!({
+            "model": "nvidia/nemotron-3-ultra-550b-a55b",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "hello from mock");
+
+    let providers = state.db.list_providers().await.unwrap();
+    let p1 = providers.iter().find(|p| p.id == "nvidia-1").unwrap();
+    assert_eq!(p1.failure_count, 1);
+    let p2 = providers.iter().find(|p| p.id == "nvidia-2").unwrap();
+    assert_eq!(p2.failure_count, 0);
+}
+
+#[tokio::test]
+async fn admin_provider_nvidia_lifecycle_hides_secret() {
+    let (app, state) = test_app("master", vec![]).await;
+    let secret = "nvapi-dashboard-secret";
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/admin/providers")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer master")
+                .body(Body::from(
+                    json!({
+                        "kind": "nvidia",
+                        "name": "NVIDIA NIM test",
+                        "api_key": secret,
+                        "base_url": "https://integrate.api.nvidia.com/v1",
+                        "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let bytes = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let provider_id = created["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["data"]["kind"], "nvidia");
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/admin/providers")
+                .header(header::AUTHORIZATION, "Bearer master")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+    let listed: Value = serde_json::from_slice(&bytes).unwrap();
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == provider_id)
+        .unwrap();
+    assert_eq!(row["kind"], "nvidia");
+    assert_eq!(row["api_key_configured"], true);
+    assert!(!listed.to_string().contains(secret));
+
+    let stored = state
+        .db
+        .find_provider_config(&provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.api_key.as_deref(), Some(secret));
+}
+
+#[tokio::test]
+async fn api_v1_chat_completions_routes_to_nvidia() {
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/chat/completions")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hello from mock");
+}
+
+#[tokio::test]
+async fn multimodal_chat_completion_with_content_parts() {
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/chat/completions")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "What is in this image?"},
+                                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,mock123"}}
+                            ]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+fn ocr_vision_upstream() -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let json_plate = json!({
+                "plate_number": "B 1234 ABC",
+                "vehicle_type": "car",
+                "confidence": "high",
+                "raw_text": "B 1234 ABC 05.28",
+                "description": "Black SUV"
+            });
+            Json(json!({
+                "id": "cmpl-ocr-mock",
+                "object": "chat.completion",
+                "created": 1234,
+                "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": format!("```json\n{}\n```", json_plate)
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 120, "completion_tokens": 40, "total_tokens": 160 }
+            }))
+        }),
+    )
+}
+
+#[tokio::test]
+async fn license_plate_ocr_successful_recognition() {
+    let mock_ocr = spawn_mock(ocr_vision_upstream()).await;
+    let (app, state) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-ocr-1".into(),
+            base_url: mock_ocr,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ocr/licenseplate")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "image": "data:image/jpeg;base64,fakeimagebytes",
+                        "instruction": "Tolong baca plat nomor mobil ini"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["plate_number"], "B 1234 ABC");
+    assert_eq!(body["data"]["vehicle_type"], "car");
+    assert_eq!(body["data"]["confidence"], "high");
+    assert_eq!(body["data"]["raw_text"], "B 1234 ABC 05.28");
+    assert_eq!(body["usage"]["total_tokens"], 160);
+
+    let summary = state.db.usage_summary_today().await.unwrap();
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].total_tokens, 160);
+}
+
+#[tokio::test]
+async fn license_plate_ocr_rejects_empty_image() {
+    let (app, _) = test_app("master", vec![]).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ocr/licenseplate")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(json!({"image": "   "}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn license_plate_ocr_supports_model_selection_and_auto_pick() {
+    let mock_ocr = spawn_mock(ocr_vision_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-ocr-custom".into(),
+            base_url: mock_ocr,
+        }],
+    )
+    .await;
+
+    for model in &[
+        "google/diffusiongemma-26b-a4b-it",
+        "google/gemma-4-31b-it",
+        "minimaxai/minimax-m3",
+        "auto",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ocr/licenseplate")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer sk-test")
+                    .body(Body::from(
+                        json!({
+                            "image": "https://example.com/plate.jpg",
+                            "model": model
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["success"], true);
+        assert_eq!(body["data"]["plate_number"], "B 1234 ABC");
+    }
+}
+
+#[tokio::test]
+async fn chat_completion_routes_diffusiongemma_and_minimax_to_nvidia() {
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    for model in &[
+        "google/diffusiongemma-26b-a4b-it",
+        "google/gemma-4-31b-it",
+        "minimaxai/minimax-m3",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/chat/completions")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer sk-test")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "Analyze image"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn chat_completion_routes_all_groq_models() {
+    let mock_groq = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![GroqKeySpec {
+            key: "gk-1".into(),
+            base_url: mock_groq,
+        }],
+        vec![],
+    )
+    .await;
+
+    for model in &[
+        "qwen/qwen3.6-27b",
+        "openai/gpt-oss-120b",
+        "llama-3.3-70b-versatile",
+        "deepseek-r1-distill-llama-70b",
+        "meta-llama/llama-prompt-guard-2-8b",
+        "mixtral-8x7b-32768",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/chat/completions")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer sk-test")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "Hello Groq"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn modality_aware_routing_prioritizes_groq_for_text_and_nvidia_for_images() {
+    let mock_groq = spawn_mock(success_upstream()).await;
+    let mock_nvidia = spawn_mock(success_upstream()).await;
+    let (app, _) = test_app_full(
+        "master",
+        vec![GroqKeySpec {
+            key: "gk-1".into(),
+            base_url: mock_groq,
+        }],
+        vec![NvidiaKeySpec {
+            key: "nv-1".into(),
+            base_url: mock_nvidia,
+        }],
+    )
+    .await;
+
+    // 1. Pure text request without explicit model -> routes to Groq for speed
+    let text_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/chat/completions")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "messages": [{"role": "user", "content": "Text only prompt"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text_res.status(), StatusCode::OK);
+
+    // 2. Multimodal request with image -> automatically routes to Nvidia vision
+    let image_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/chat/completions")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe image"},
+                                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+                            ]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_dns_endpoint_query() {
+    let (app, _) = test_app("master", vec![]).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/admin/dns?host=cloudflare.com&server=1.1.1.1")
+                .method("GET")
+                .header(header::AUTHORIZATION, "Bearer master")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["host"], "cloudflare.com");
 }

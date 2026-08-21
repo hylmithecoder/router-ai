@@ -21,6 +21,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Groq,
+    Nvidia,
     OpenCode,
     Codex,
     Claude,
@@ -31,6 +32,7 @@ impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Groq => "groq",
+            Self::Nvidia => "nvidia",
             Self::OpenCode => "opencode",
             Self::Codex => "codex",
             Self::Claude => "claude",
@@ -41,6 +43,7 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "groq" => Some(Self::Groq),
+            "nvidia" | "nim" | "build-nvidia" => Some(Self::Nvidia),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "codex" | "codex-cli" => Some(Self::Codex),
             "claude" | "claude-code" => Some(Self::Claude),
@@ -50,7 +53,10 @@ impl ProviderKind {
     }
 
     pub fn is_cli(self) -> bool {
-        !matches!(self, Self::Groq)
+        matches!(
+            self,
+            Self::OpenCode | Self::Codex | Self::Claude | Self::Agy
+        )
     }
 }
 
@@ -118,6 +124,7 @@ impl Provider {
     pub fn new_http(
         id: &str,
         name: &str,
+        kind: ProviderKind,
         base_url: &str,
         api_key: Option<&str>,
         model: &str,
@@ -125,7 +132,7 @@ impl Provider {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            kind: ProviderKind::Groq,
+            kind,
             base_url: base_url.to_string(),
             api_key: api_key.map(ToOwned::to_owned),
             command: None,
@@ -200,12 +207,11 @@ impl Provider {
     }
 
     pub fn is_available(&self) -> bool {
-        match self.kind {
-            ProviderKind::Groq => {
-                self.api_key.as_ref().is_some_and(|key| !key.is_empty())
-                    && !self.base_url.trim().is_empty()
-            }
-            _ => self.command.as_deref().is_some_and(command_is_available),
+        if self.kind.is_cli() {
+            self.command.as_deref().is_some_and(command_is_available)
+        } else {
+            self.api_key.as_ref().is_some_and(|key| !key.is_empty())
+                && !self.base_url.trim().is_empty()
         }
     }
 
@@ -221,7 +227,18 @@ impl Provider {
 
         let forwarded = self.normalized_request(req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut request = client.post(&url).json(&forwarded);
+        let is_stream = req.stream.unwrap_or(false);
+        let accept_header = if is_stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, accept_header)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&forwarded);
         if let Some(key) = self.api_key.as_deref() {
             request = request.bearer_auth(key);
         }
@@ -256,7 +273,11 @@ impl Provider {
 
         let forwarded = self.normalized_request(req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut request = client.post(&url).json(&forwarded);
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&forwarded);
         if let Some(key) = self.api_key.as_deref() {
             request = request.bearer_auth(key);
         }
@@ -278,8 +299,7 @@ impl Provider {
         let mut forwarded = req.clone();
         forwarded.provider = None;
         if forwarded.model.trim().is_empty()
-            || forwarded.model.eq_ignore_ascii_case("auto")
-            || forwarded.model.eq_ignore_ascii_case("default")
+            || is_provider_alias(&self.id, self.kind, &forwarded.model)
         {
             forwarded.model = self.model.clone();
         }
@@ -380,10 +400,7 @@ impl Provider {
             model: response_model,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_string(),
-                    content: text,
-                },
+                message: ChatMessage::assistant(text),
                 finish_reason: Some("stop".to_string()),
             }],
             usage: Usage {
@@ -449,7 +466,7 @@ impl Provider {
                 args.push(prompt.to_string());
                 (args, false)
             }
-            ProviderKind::Groq => (vec![prompt.to_string()], false),
+            ProviderKind::Groq | ProviderKind::Nvidia => (vec![prompt.to_string()], false),
         }
     }
 }
@@ -478,7 +495,7 @@ fn render_prompt(req: &ChatCompletionRequest) -> String {
     for message in &req.messages {
         out.push_str(&message.role.to_ascii_uppercase());
         out.push_str(":\n");
-        out.push_str(&message.content);
+        out.push_str(&message.content.as_text());
         out.push_str("\n\n");
     }
     out.push_str("ASSISTANT:\n");
@@ -512,7 +529,7 @@ fn extract_cli_text(kind: ProviderKind, raw: &str) -> Option<String> {
         ProviderKind::Claude => extract_claude_result(clean),
         ProviderKind::Codex => extract_codex_messages(clean),
         ProviderKind::OpenCode => extract_opencode_text(clean),
-        ProviderKind::Agy | ProviderKind::Groq => None,
+        ProviderKind::Agy | ProviderKind::Groq | ProviderKind::Nvidia => None,
     };
 
     structured
@@ -657,6 +674,12 @@ mod tests {
             ProviderKind::parse("open-code"),
             Some(ProviderKind::OpenCode)
         );
+        assert_eq!(ProviderKind::parse("nvidia"), Some(ProviderKind::Nvidia));
+        assert_eq!(ProviderKind::parse("nim"), Some(ProviderKind::Nvidia));
+        assert_eq!(
+            ProviderKind::parse("build-nvidia"),
+            Some(ProviderKind::Nvidia)
+        );
         assert_eq!(ProviderKind::parse("unknown"), None);
     }
 
@@ -687,17 +710,14 @@ mod tests {
             "agy",
             "Agy CLI",
             ProviderKind::Agy,
-            "/bin/echo",
+            "echo",
             "default",
             ".",
             2,
         );
         let request = ChatCompletionRequest {
             model: "agy".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
+            messages: vec![ChatMessage::user("hello")],
             temperature: None,
             max_tokens: None,
             stream: Some(false),
@@ -705,13 +725,20 @@ mod tests {
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
+            chat_template_kwargs: None,
             provider: Some("agy".to_string()),
         };
         let response = provider
             .chat_completion(&reqwest::Client::new(), &request)
             .await
             .unwrap();
-        assert!(response.choices[0].message.content.contains("ASSISTANT:"));
+        assert!(
+            response.choices[0]
+                .message
+                .content
+                .as_text()
+                .contains("ASSISTANT:")
+        );
         assert!(response.usage.total_tokens > 0);
     }
 }

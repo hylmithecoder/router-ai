@@ -18,7 +18,10 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{middleware::request_id, state::AppState};
+use crate::{
+    middleware::{http_logger, request_id},
+    state::AppState,
+};
 
 mod admin;
 mod api;
@@ -57,6 +60,7 @@ pub fn create_router(state: AppState) -> Router {
         // into a single `ServiceBuilder` while preserving the required `Service` trait bounds.
         // This layer is the outermost one: request id is attached before CORS, trace, or timeout.
         .layer(from_fn(request_id))
+        .layer(from_fn(http_logger))
         // Provide the state. The router is no longer missing state, so the type becomes `Router<()>`.
         .with_state(state)
         // Serve the statically exported Next.js dashboard on the same port.

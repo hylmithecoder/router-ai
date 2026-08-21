@@ -1,7 +1,10 @@
 // Empty (default) = same origin as the dashboard itself: the single-binary
 // mode serves both API and static dashboard from one port. In dev, set
 // NEXT_PUBLIC_ROUTER_API_URL=http://127.0.0.1:5790 in webui/.env.local.
-const API_URL = (process.env.NEXT_PUBLIC_ROUTER_API_URL ?? "").replace(/\/+$/, "");
+const API_URL = (process.env.NEXT_PUBLIC_ROUTER_API_URL ?? "").replace(
+  /\/+$/,
+  "",
+);
 
 const KEY_STORAGE = "router_master_key";
 
@@ -109,7 +112,7 @@ export interface ApiKey {
 
 export interface Provider {
   id: string;
-  kind: "groq" | "opencode" | "codex" | "claude" | "agy" | string;
+  kind: "groq" | "nvidia" | "opencode" | "codex" | "claude" | "agy" | string;
   name: string;
   base_url: string;
   model: string;
@@ -133,29 +136,50 @@ export const api = {
     ),
   listKeys: () => request<ApiResponse<ApiKey[]>>("/api/v1/admin/keys"),
   createKey: (name: string, quota: number) =>
-    request<ApiResponse<{ id: string; name: string; key: string; quota_daily_tokens: number }>>(
-      "/api/v1/admin/keys",
-      { method: "POST", body: JSON.stringify({ name, quota_daily_tokens: quota }) },
-    ),
-  updateKey: (id: string, patch: { quota_daily_tokens?: number; enabled?: boolean }) =>
+    request<
+      ApiResponse<{
+        id: string;
+        name: string;
+        key: string;
+        quota_daily_tokens: number;
+      }>
+    >("/api/v1/admin/keys", {
+      method: "POST",
+      body: JSON.stringify({ name, quota_daily_tokens: quota }),
+    }),
+  updateKey: (
+    id: string,
+    patch: { quota_daily_tokens?: number; enabled?: boolean },
+  ) =>
     request<ApiResponse<unknown>>(`/api/v1/admin/keys/${id}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
     }),
   deleteKey: (id: string) =>
-    request<ApiResponse<unknown>>(`/api/v1/admin/keys/${id}`, { method: "DELETE" }),
-  listProviders: () => request<ApiResponse<Provider[]>>("/api/v1/admin/providers"),
+    request<ApiResponse<unknown>>(`/api/v1/admin/keys/${id}`, {
+      method: "DELETE",
+    }),
+  listProviders: () =>
+    request<ApiResponse<Provider[]>>("/api/v1/admin/providers"),
   createProvider: (payload: {
-    kind: "groq";
+    kind: "groq" | "nvidia" | string;
     name?: string;
     api_key: string;
     base_url?: string;
     model?: string;
   }) =>
-    request<ApiResponse<{ id: string; kind: string; name: string; base_url: string; model: string }>>(
-      "/api/v1/admin/providers",
-      { method: "POST", body: JSON.stringify(payload) },
-    ),
+    request<
+      ApiResponse<{
+        id: string;
+        kind: string;
+        name: string;
+        base_url: string;
+        model: string;
+      }>
+    >("/api/v1/admin/providers", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   updateProvider: (
     id: string,
     patch: {
@@ -170,7 +194,9 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   deleteProvider: (id: string) =>
-    request<ApiResponse<unknown>>(`/api/v1/admin/providers/${id}`, { method: "DELETE" }),
+    request<ApiResponse<unknown>>(`/api/v1/admin/providers/${id}`, {
+      method: "DELETE",
+    }),
   toggleProvider: (id: string, enabled: boolean) =>
     request<ApiResponse<unknown>>(`/api/v1/admin/providers/${id}/toggle`, {
       method: "POST",

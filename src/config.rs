@@ -22,6 +22,9 @@ const DEFAULT_APP_NAME: &str = "router-api-ai";
 /// Default Groq endpoint.
 const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
+/// Default NVIDIA endpoint.
+const DEFAULT_NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
+
 /// Root configuration object.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -53,6 +56,11 @@ pub struct RouterSettings {
     pub groq_api_keys: Vec<GroqKeySpec>,
     /// Base URL for the Groq OpenAI-compatible API.
     pub groq_base_url: String,
+    /// Upstream NVIDIA API keys, ordered by fallback priority.
+    /// Each entry may be `key` (uses `nvidia_base_url`) or `key@https://base.url`.
+    pub nvidia_api_keys: Vec<NvidiaKeySpec>,
+    /// Base URL for the NVIDIA OpenAI-compatible API.
+    pub nvidia_base_url: String,
     /// Default model served by every provider.
     pub default_model: String,
     /// SQLite database file path.
@@ -84,6 +92,13 @@ pub struct GroqKeySpec {
     pub base_url: String,
 }
 
+/// One upstream NVIDIA provider entry: an API key plus (optional) custom base URL.
+#[derive(Debug, Clone)]
+pub struct NvidiaKeySpec {
+    pub key: String,
+    pub base_url: String,
+}
+
 impl Settings {
     /// Build configuration from defaults and environment variables.
     pub fn new() -> Self {
@@ -92,6 +107,9 @@ impl Settings {
 
         let groq_base_url =
             env::var("ROUTER_GROQ_BASE_URL").unwrap_or_else(|_| DEFAULT_GROQ_BASE_URL.to_string());
+
+        let nvidia_base_url = env::var("ROUTER_NVIDIA_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_NVIDIA_BASE_URL.to_string());
 
         let api_keys = env::var("ROUTER_API_KEYS")
             .ok()
@@ -122,6 +140,29 @@ impl Settings {
                             None => GroqKeySpec {
                                 key: entry.to_string(),
                                 base_url: groq_base_url.clone(),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let nvidia_api_keys = env::var("NVIDIA_API_KEYS")
+            .or_else(|_| env::var("NVIDIA_API_KEY"))
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter(|k| !k.trim().is_empty())
+                    .map(|entry| {
+                        let entry = entry.trim();
+                        match entry.split_once('@') {
+                            Some((key, url)) => NvidiaKeySpec {
+                                key: key.trim().to_string(),
+                                base_url: url.trim().to_string(),
+                            },
+                            None => NvidiaKeySpec {
+                                key: entry.to_string(),
+                                base_url: nvidia_base_url.clone(),
                             },
                         }
                     })
@@ -169,6 +210,8 @@ impl Settings {
                 api_keys,
                 groq_api_keys,
                 groq_base_url,
+                nvidia_api_keys,
+                nvidia_base_url,
                 default_model,
                 db_path,
                 static_dir,

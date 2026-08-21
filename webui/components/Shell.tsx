@@ -7,6 +7,7 @@ const NAV = [
   { href: "/usage", label: "Usage log" },
   { href: "/keys", label: "API keys" },
   { href: "/providers", label: "Providers" },
+  { href: "/docs", label: "API Docs (Swagger)" },
 ];
 
 export default function Shell({ children }: { children: React.ReactNode }) {

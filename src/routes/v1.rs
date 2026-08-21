@@ -10,7 +10,10 @@ use axum::{
 };
 
 use crate::{
-    handlers::chat::{chat_completion, list_models},
+    handlers::{
+        chat::{chat_completion, list_models},
+        ocr::license_plate_ocr,
+    },
     middleware::require_api_key,
     state::AppState,
 };
@@ -20,5 +23,6 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/chat/completions", post(chat_completion))
         .route("/models", get(list_models))
+        .route("/ocr/licenseplate", post(license_plate_ocr))
         .layer(from_fn_with_state(state, require_api_key))
 }

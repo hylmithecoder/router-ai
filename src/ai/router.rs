@@ -29,15 +29,13 @@ pub struct AiRouter {
     db: Db,
 }
 
+use crate::dns::build_dns_hardened_client;
+
 impl AiRouter {
     /// Build the router from persisted providers, environment-seeded Groq keys,
     /// and locally discovered agent CLIs.
     pub async fn new(settings: &Settings, db: Db) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("failed to build http client");
+        let client = build_dns_hardened_client(&[]).await;
 
         for (i, spec) in settings.router.groq_api_keys.iter().enumerate() {
             db.ensure_provider(
@@ -51,6 +49,20 @@ impl AiRouter {
             )
             .await
             .expect("failed to seed Groq provider");
+        }
+
+        for (i, spec) in settings.router.nvidia_api_keys.iter().enumerate() {
+            db.ensure_provider(
+                &format!("nvidia-{}", i + 1),
+                "nvidia",
+                &format!("NVIDIA #{}", i + 1),
+                &spec.base_url,
+                Some(&spec.key),
+                None,
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            )
+            .await
+            .expect("failed to seed NVIDIA provider");
         }
 
         for spec in discover_local_agents() {
@@ -81,7 +93,7 @@ impl AiRouter {
                 )
             })
             .collect::<Vec<_>>();
-        // HTTP Groq keys are the default pool for `auto`; local agents remain
+        // HTTP providers (Groq, Nvidia) are the default pool for `auto`; local agents remain
         // available as explicit selectors and as later fallbacks.
         providers.sort_by_key(|provider| if provider.kind.is_cli() { 1 } else { 0 });
 
@@ -106,7 +118,10 @@ impl AiRouter {
         &self,
         req: &ChatCompletionRequest,
     ) -> Result<CompletionOutcome, RouterError> {
-        let candidates = self.candidates(req.provider.as_deref()).await?;
+        let has_images = req.has_images();
+        let candidates = self
+            .candidates(req.provider.as_deref(), Some(&req.model), has_images)
+            .await?;
         let mut last_error: Option<String> = None;
 
         for (id, provider) in candidates {
@@ -147,7 +162,10 @@ impl AiRouter {
     /// Route a streaming request. HTTP providers are passed through as SSE;
     /// local CLIs return one synthesized SSE completion after the process exits.
     pub async fn stream(&self, req: &ChatCompletionRequest) -> Result<StreamOutcome, RouterError> {
-        let candidates = self.candidates(req.provider.as_deref()).await?;
+        let has_images = req.has_images();
+        let candidates = self
+            .candidates(req.provider.as_deref(), Some(&req.model), has_images)
+            .await?;
         let mut last_error: Option<String> = None;
 
         for (id, provider) in candidates {
@@ -206,19 +224,46 @@ impl AiRouter {
         ))
     }
 
+    /// Automatically pick or validate the best available vision model for multimodal tasks.
+    pub async fn resolve_vision_model(&self, requested: Option<&str>) -> String {
+        if let Some(m) = requested
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        {
+            return m.to_string();
+        }
+
+        let providers = self.providers.read().await;
+        for p in providers.iter() {
+            if p.enabled && !p.in_cooldown() && p.kind == ProviderKind::Nvidia {
+                if !p.model.is_empty() && p.model != "default" {
+                    return p.model.clone();
+                }
+                return "google/diffusiongemma-26b-a4b-it".to_string();
+            }
+        }
+
+        "google/diffusiongemma-26b-a4b-it".to_string()
+    }
+
     async fn candidates(
         &self,
         selector: Option<&str>,
+        requested_model: Option<&str>,
+        has_images: bool,
     ) -> Result<Vec<(String, Provider)>, RouterError> {
         let providers = self.providers.read().await;
         let selector = selector.map(str::trim).filter(|s| !s.is_empty());
+        let requested_model = requested_model.map(str::trim).filter(|s| !s.is_empty());
 
         let mut out = Vec::new();
         for provider in providers.iter() {
+            // When images are present in the request, do not route to text-only CLI tools
+            if has_images && provider.kind.is_cli() {
+                continue;
+            }
+
             let matches = match selector {
-                // Existing OpenAI-compatible `/v1` clients stay on HTTP Groq
-                // providers unless they explicitly opt into local agents.
-                None => provider.kind == ProviderKind::Groq,
                 Some(value)
                     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("all") =>
                 {
@@ -227,11 +272,42 @@ impl AiRouter {
                 Some(value) if value.eq_ignore_ascii_case("groq") => {
                     provider.kind == ProviderKind::Groq
                 }
+                Some(value) if value.eq_ignore_ascii_case("nvidia") => {
+                    provider.kind == ProviderKind::Nvidia
+                }
                 Some(value) => {
                     ProviderKind::parse(value).is_some_and(|kind| provider.kind == kind)
                         || provider.id.eq_ignore_ascii_case(value)
                         || provider.name.eq_ignore_ascii_case(value)
                         || provider.kind.as_str().eq_ignore_ascii_case(value)
+                }
+                None => {
+                    if has_images {
+                        // When images are present, prioritize vision-capable providers (Nvidia)
+                        provider.kind == ProviderKind::Nvidia
+                            || is_vision_model(&provider.model)
+                            || requested_model.map(is_vision_model).unwrap_or(false)
+                    } else if let Some(model) = requested_model {
+                        if is_nvidia_model(model)
+                            || (provider.kind == ProviderKind::Nvidia
+                                && provider.model.eq_ignore_ascii_case(model))
+                        {
+                            provider.kind == ProviderKind::Nvidia
+                        } else if is_groq_model(model)
+                            || (provider.kind == ProviderKind::Groq
+                                && provider.model.eq_ignore_ascii_case(model))
+                        {
+                            provider.kind == ProviderKind::Groq
+                        } else if let Some(cli_kind) =
+                            ProviderKind::parse(model).filter(|k| k.is_cli())
+                        {
+                            provider.kind == cli_kind || provider.id.eq_ignore_ascii_case(model)
+                        } else {
+                            !provider.kind.is_cli()
+                        }
+                    } else {
+                        !provider.kind.is_cli()
+                    }
                 }
             };
             if matches {
@@ -248,6 +324,7 @@ impl AiRouter {
         if out.is_empty() {
             return Err(RouterError::NoProviders);
         }
+        out.sort_by_key(|(_, provider)| provider_relevance(provider, requested_model, has_images));
         Ok(out)
     }
 
@@ -327,6 +404,10 @@ impl AiRouter {
             if !provider.model.is_empty() && provider.model != "default" {
                 seen.insert(provider.model.clone());
             }
+            if provider.kind == ProviderKind::Nvidia {
+                seen.insert("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning".to_string());
+                seen.insert("nvidia/nemotron-3-ultra-550b-a55b".to_string());
+            }
             if provider.kind.is_cli() {
                 seen.insert(provider.id.clone());
             }
@@ -386,6 +467,78 @@ fn provider_error_message(err: &ProviderError) -> String {
 /// Client errors that should not be retried against another provider.
 fn is_client_error(err: &ProviderError) -> bool {
     matches!(err, ProviderError::Auth(_))
+}
+
+pub fn is_groq_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m == "groq"
+        || m.starts_with("groq/")
+        || m.starts_with("qwen")
+        || m.starts_with("openai/gpt-oss")
+        || m.starts_with("llama")
+        || m.starts_with("meta-llama/")
+        || m.starts_with("deepseek")
+        || m.starts_with("mixtral")
+        || m.starts_with("mistral")
+        || m.starts_with("gemma2")
+        || m.starts_with("whisper")
+}
+
+pub fn is_nvidia_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m == "nvidia"
+        || m.starts_with("nvidia/")
+        || m.starts_with("nemotron")
+        || m.starts_with("google/diffusiongemma")
+        || m.starts_with("google/gemma-4")
+        || m.starts_with("minimaxai/")
+}
+
+pub fn is_vision_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.starts_with("google/diffusiongemma")
+        || m.starts_with("google/gemma-4")
+        || m.starts_with("minimaxai/")
+        || m.starts_with("nvidia/nemotron-3-nano-omni")
+        || m.contains("vision")
+        || m.contains("omni")
+}
+
+fn provider_relevance(provider: &Provider, requested_model: Option<&str>, has_images: bool) -> u32 {
+    if has_images {
+        // When images are present, prioritize vision-capable providers (Nvidia)
+        if provider.kind == ProviderKind::Nvidia || is_vision_model(&provider.model) {
+            0
+        } else if !provider.kind.is_cli() {
+            5
+        } else {
+            20
+        }
+    } else {
+        let Some(model) = requested_model else {
+            // Pure text default: Groq has top priority (0) for ultra-fast throughput
+            return match provider.kind {
+                ProviderKind::Groq => 0,
+                ProviderKind::Nvidia => 1,
+                _ if !provider.kind.is_cli() => 2,
+                _ => 10,
+            };
+        };
+        let model_lower = model.to_ascii_lowercase();
+        let is_nvidia_match =
+            is_nvidia_model(&model_lower) && provider.kind == ProviderKind::Nvidia;
+        let is_groq_match = is_groq_model(&model_lower) && provider.kind == ProviderKind::Groq;
+        let is_direct_match =
+            provider.model.eq_ignore_ascii_case(model) || provider.id.eq_ignore_ascii_case(model);
+
+        if is_nvidia_match || is_groq_match || is_direct_match {
+            0
+        } else if !provider.kind.is_cli() {
+            1
+        } else {
+            10
+        }
+    }
 }
 
 trait EmptyStringFallback {
