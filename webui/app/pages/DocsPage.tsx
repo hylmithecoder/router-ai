@@ -62,87 +62,84 @@ const ENDPOINTS: ApiEndpoint[] = [
         ),
       },
       {
-        name: "Groq OpenAI GPT-OSS 120B",
-        body: JSON.stringify(
-          {
-            model: "openai/gpt-oss-120b",
-            messages: [
-              {
-                role: "user",
-                content: "Write a concise summary of distributed computing.",
-              },
-            ],
-            temperature: 0.7,
-          },
-          null,
-          2,
-        ),
-      },
-      {
-        name: "Groq Llama 3.3 70B Versatile",
+        name: "Groq LLaMA 3.3 70B (Versatile)",
         body: JSON.stringify(
           {
             model: "llama-3.3-70b-versatile",
             messages: [
               {
                 role: "user",
-                content: "Provide 3 key optimizations for SQLite databases.",
+                content: "List top 3 advantages of building on Linux with Rust.",
               },
             ],
-            temperature: 0.7,
           },
           null,
           2,
         ),
       },
       {
-        name: "Groq DeepSeek R1 Distill 70B",
+        name: "Groq DeepSeek R1 Distill 70B (Reasoning)",
         body: JSON.stringify(
           {
             model: "deepseek-r1-distill-llama-70b",
             messages: [
               {
                 role: "user",
-                content: "Solve step-by-step: How many r's are in strawberry?",
+                content: "Solve: What is the sum of integers from 1 to 100?",
               },
             ],
-            temperature: 0.6,
           },
           null,
           2,
         ),
       },
       {
-        name: "NVIDIA Nemotron 550B MoE (Reasoning)",
-        body: JSON.stringify(
-          {
-            model: "nvidia/nemotron-3-ultra-550b-a55b",
-            messages: [
-              {
-                role: "user",
-                content:
-                  "Design a high-throughput async pipeline architecture in Rust.",
-              },
-            ],
-            temperature: 0.6,
-          },
-          null,
-          2,
-        ),
-      },
-      {
-        name: "NVIDIA Google DiffusionGemma 26B (Vision)",
+        name: "Google DiffusionGemma 26B (Vision & OCR)",
         body: JSON.stringify(
           {
             model: "google/diffusiongemma-26b-a4b-it",
             messages: [
               {
                 role: "user",
-                content:
-                  "Describe the importance of multimodal perception in autonomous systems.",
+                content: [
+                  {
+                    type: "text",
+                    text: "Identify objects and read visible text in this scene.",
+                  },
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: "https://assets.ngc.nvidia.com/products/api-catalog/phi-3-5-vision/example1b.jpg",
+                    },
+                  },
+                ],
               },
             ],
-            temperature: 0.7,
+            max_tokens: 1024,
+          },
+          null,
+          2,
+        ),
+      },
+      {
+        name: "MiniMax-M3 427B (Dense Vision)",
+        body: JSON.stringify(
+          {
+            model: "minimaxai/minimax-m3",
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "Describe what you see in the photo." },
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: "https://assets.ngc.nvidia.com/products/api-catalog/phi-3-5-vision/example1b.jpg",
+                    },
+                  },
+                ],
+              },
+            ],
           },
           null,
           2,
@@ -179,21 +176,66 @@ const ENDPOINTS: ApiEndpoint[] = [
     ],
   },
   {
+    id: "ocr-description",
+    method: "POST",
+    path: "/api/v1/ocr/description",
+    category: "Computer Vision",
+    summary: "General Visual Description & OCR Extractor",
+    description:
+      "Analyzes any image with multi-teacher vision failover, extracting comprehensive natural description, visible typography, and safety tags.",
+    auth: "API Key (Bearer)",
+    defaultBody: JSON.stringify(
+      {
+        image: "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
+        instruction: "Analisis isi gambar, deteksi teks OCR, dan evaluasi keamanan konten.",
+        model: "auto",
+      },
+      null,
+      2,
+    ),
+    presets: [
+      {
+        name: "Discord AutoMod Scan",
+        body: JSON.stringify(
+          {
+            image: "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
+            instruction: "Evaluasi konten untuk Discord AutoMod: deteksi teks, NSFW, atau toxic.",
+            model: "auto",
+          },
+          null,
+          2,
+        ),
+      },
+      {
+        name: "Typography & Watermark Extract",
+        body: JSON.stringify(
+          {
+            image: "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
+            instruction: "Fokuskan pada pembacaan teks spanduk, banner, dan watermark.",
+            model: "auto",
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  },
+  {
     id: "ocr-licenseplate",
     method: "POST",
     path: "/api/v1/ocr/licenseplate",
     category: "Computer Vision",
-    summary: "Vehicle License Plate OCR",
+    summary: "Vehicle License Plate OCR & Local ALPR Fallback",
     description:
-      "Multimodal vision endpoint that analyzes vehicle images (base64 or URL) and extracts structured license plate numbers, vehicle type, and details.",
+      "Multimodal vision endpoint with cloud vision teacher models and automatic failover to local YOLOv11 ONNX + OpenCV engine.",
     auth: "API Key (Bearer)",
     defaultBody: JSON.stringify(
       {
         image:
-          "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d0/Indonesian_license_plate_B_1234_ABC.jpg/640px-Indonesian_license_plate_B_1234_ABC.jpg",
+          "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
         instruction:
           "Ekstrak plat nomor kendaraan dan tipe kendaraan dengan teliti.",
-        model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        model: "auto",
       },
       null,
       2,
@@ -226,58 +268,6 @@ const ENDPOINTS: ApiEndpoint[] = [
           2,
         ),
       },
-      {
-        name: "Google Gemma-4 31B (Vision)",
-        body: JSON.stringify(
-          {
-            image:
-              "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
-            instruction: "Ekstrak plat nomor kendaraan dan warna kendaraan.",
-            model: "google/gemma-4-31b-it",
-          },
-          null,
-          2,
-        ),
-      },
-      {
-        name: "MiniMax-M3 427B (Vision)",
-        body: JSON.stringify(
-          {
-            image:
-              "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
-            instruction: "Ekstrak nomor plat dan jenis kendaraan.",
-            model: "minimaxai/minimax-m3",
-          },
-          null,
-          2,
-        ),
-      },
-      {
-        name: "NVIDIA Nemotron 30B (Omni)",
-        body: JSON.stringify(
-          {
-            image:
-              "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
-            instruction: "Ekstrak nomor polisi kendaraan.",
-            model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-          },
-          null,
-          2,
-        ),
-      },
-      {
-        name: "Raw Base64 Input",
-        body: JSON.stringify(
-          {
-            image:
-              "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
-            instruction: "Read vehicle license plate.",
-            model: "auto",
-          },
-          null,
-          2,
-        ),
-      },
     ],
   },
   {
@@ -301,11 +291,11 @@ const ENDPOINTS: ApiEndpoint[] = [
     auth: "API Key (Bearer)",
     defaultBody: JSON.stringify(
       {
-        provider: "auto",
+        model: "qwen/qwen3.6-27b",
         messages: [
           {
             role: "user",
-            content: "Summarize quantum computing in 1 sentence.",
+            content: "Write a high-performance HTTP client snippet in Rust.",
           },
         ],
       },
@@ -314,61 +304,33 @@ const ENDPOINTS: ApiEndpoint[] = [
     ),
   },
   {
-    id: "health",
+    id: "admin-dns-query",
     method: "GET",
-    path: "/health",
-    category: "System",
-    summary: "Liveness Probe",
-    description: "Checks if the HTTP server is alive and responding.",
-    auth: "None",
-  },
-  {
-    id: "health-ready",
-    method: "GET",
-    path: "/health/ready",
-    category: "System",
-    summary: "Readiness Probe",
-    description: "Verifies SQLite database connectivity and router readiness.",
-    auth: "None",
-  },
-  {
-    id: "admin-summary",
-    method: "GET",
-    path: "/api/v1/admin/usage/summary",
+    path: "/api/v1/admin/dns?domain=integrate.api.nvidia.com",
     category: "Admin",
-    summary: "Usage Analytics Summary",
+    summary: "Direct Async UDP DNS Resolver (RFC 1035)",
     description:
-      "Aggregated today metrics, per-key usage, provider distribution, and 7-day volume.",
-    auth: "Master Key (Bearer)",
-  },
-  {
-    id: "admin-dns",
-    method: "GET",
-    path: "/api/v1/admin/dns?host=ilmeee.com&server=1.1.1.1",
-    category: "System",
-    summary: "Async DNS Dig Query (1.1.1.1)",
-    description:
-      "Performs real-time UDP DNS queries directly against 1.1.1.1 / 8.8.8.8 to bypass ISP filters and resolve domain IPs.",
+      "Executes real-time DNS resolution via Cloudflare 1.1.1.1 or Google 8.8.8.8 bypassing local ISP DNS poisoning.",
     auth: "Master Key (Bearer)",
   },
 ];
 
-export default function ApiDocsPage() {
+export default function DocsPage() {
   const [selectedEndpoint, setSelectedEndpoint] = useState<ApiEndpoint>(
     ENDPOINTS[0],
   );
-  const [apiKey, setApiKey] = useState("");
-  const [requestBody, setRequestBody] = useState(
-    selectedEndpoint.defaultBody || "",
+  const [apiKey, setApiKey] = useState<string>("");
+  const [requestBody, setRequestBody] = useState<string>(
+    ENDPOINTS[0].defaultBody || "",
   );
+  const [responseBody, setResponseBody] = useState<string>("");
   const [responseStatus, setResponseStatus] = useState<number | null>(null);
   const [responseDuration, setResponseDuration] = useState<number | null>(null);
-  const [responseBody, setResponseBody] = useState<string>("");
-  const [loading, setLoading] = useState(false);
-  const [copiedTab, setCopiedTab] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
   const [activeLang, setActiveLang] = useState<
-    "curl" | "python" | "typescript" | "rust"
+    "curl" | "python" | "typescript" | "rust" | "golang"
   >("curl");
+  const [copiedTab, setCopiedTab] = useState<string | null>(null);
 
   useEffect(() => {
     const master = getMasterKey();
@@ -380,61 +342,65 @@ export default function ApiDocsPage() {
   function handleSelectEndpoint(ep: ApiEndpoint) {
     setSelectedEndpoint(ep);
     setRequestBody(ep.defaultBody || "");
-    setResponseStatus(null);
     setResponseBody("");
+    setResponseStatus(null);
     setResponseDuration(null);
   }
 
-  function handlePreset(body: string) {
-    setRequestBody(body);
+  function handlePreset(presetBody: string) {
+    setRequestBody(presetBody);
   }
 
   async function executeRequest() {
     setLoading(true);
     setResponseBody("");
     setResponseStatus(null);
-    const start = performance.now();
+    setResponseDuration(null);
+
+    const startTime = performance.now();
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (apiKey.trim()) {
+      headers["Authorization"] = `Bearer ${apiKey.trim()}`;
+    }
 
     try {
-      const headers: Record<string, string> = {};
-      if (
-        selectedEndpoint.method === "POST" ||
-        selectedEndpoint.method === "PATCH"
-      ) {
-        headers["Content-Type"] = "application/json";
-      }
-      if (selectedEndpoint.auth !== "None" && apiKey.trim()) {
-        headers["Authorization"] = `Bearer ${apiKey.trim()}`;
-      }
-
-      const res = await fetch(selectedEndpoint.path, {
+      const options: RequestInit = {
         method: selectedEndpoint.method,
         headers,
-        body:
-          selectedEndpoint.method === "POST" ||
-          selectedEndpoint.method === "PATCH"
-            ? requestBody
-            : undefined,
-      });
+      };
 
-      const elapsed = Math.round(performance.now() - start);
-      setResponseDuration(elapsed);
+      if (selectedEndpoint.method !== "GET" && requestBody) {
+        options.body = requestBody;
+      }
+
+      const res = await fetch(selectedEndpoint.path, options);
+      const duration = Math.round(performance.now() - startTime);
+      setResponseDuration(duration);
       setResponseStatus(res.status);
 
-      const contentType = res.headers.get("content-type") || "";
-      if (contentType.includes("application/json")) {
-        const data = await res.json();
-        setResponseBody(JSON.stringify(data, null, 2));
-      } else {
-        const text = await res.text();
+      const text = await res.text();
+      try {
+        const json = JSON.parse(text);
+        setResponseBody(JSON.stringify(json, null, 2));
+      } catch {
         setResponseBody(text);
       }
     } catch (err: unknown) {
-      const elapsed = Math.round(performance.now() - start);
-      setResponseDuration(elapsed);
+      const duration = Math.round(performance.now() - startTime);
+      setResponseDuration(duration);
       setResponseStatus(0);
       setResponseBody(
-        `Network Error: ${err instanceof Error ? err.message : String(err)}`,
+        JSON.stringify(
+          {
+            error: "Network / Client Error",
+            message: err instanceof Error ? err.message : String(err),
+          },
+          null,
+          2,
+        ),
       );
     } finally {
       setLoading(false);
@@ -442,45 +408,51 @@ export default function ApiDocsPage() {
   }
 
   function generateSnippet(
-    lang: "curl" | "python" | "typescript" | "rust",
+    lang: "curl" | "python" | "typescript" | "rust" | "golang",
   ): string {
-    const url = `http://127.0.0.1:5790${selectedEndpoint.path}`;
-    const token = apiKey.trim() || "sk-router-your-key";
+    const token = apiKey ? apiKey.trim() : "YOUR_API_KEY";
+    const origin =
+      typeof window !== "undefined"
+        ? window.location.origin
+        : "http://127.0.0.1:5790";
+    const fullUrl = `${origin}${selectedEndpoint.path}`;
 
     if (lang === "curl") {
       if (selectedEndpoint.method === "GET") {
-        if (selectedEndpoint.auth === "None") {
-          return `curl -X GET "${url}"`;
-        }
-        return `curl -X GET "${url}" \\\n  -H "Authorization: Bearer ${token}"`;
+        return `curl -X GET "${fullUrl}" \\\n  -H "Authorization: Bearer ${token}"`;
       }
-      return `curl -X POST "${url}" \\\n  -H "Authorization: Bearer ${token}" \\\n  -H "Content-Type: application/json" \\\n  -d '${requestBody.replace(/'/g, "'\\''")}'`;
+      return `curl -X POST "${fullUrl}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${token}" \\\n  -d '${requestBody.replace(/'/g, "\\'")}'`;
     }
 
     if (lang === "python") {
       if (selectedEndpoint.method === "GET") {
-        return `import requests\n\nresponse = requests.get(\n    "${url}",\n    headers={"Authorization": "Bearer ${token}"}\n)\nprint(response.json())`;
+        return `import requests\n\nurl = "${fullUrl}"\nheaders = {"Authorization": "Bearer ${token}"}\n\nresponse = requests.get(url, headers=headers)\nprint(response.json())`;
       }
-      return `import requests\n\npayload = ${requestBody || "{}"}\n\nresponse = requests.post(\n    "${url}",\n    headers={\n        "Authorization": "Bearer ${token}",\n        "Content-Type": "application/json"\n    },\n    json=payload\n)\nprint(response.json())`;
+      return `import requests\n\nurl = "${fullUrl}"\nheaders = {\n    "Content-Type": "application/json",\n    "Authorization": "Bearer ${token}"\n}\npayload = ${requestBody || "{}"}\n\nresponse = requests.post(url, json=payload, headers=headers)\nprint(response.json())`;
     }
 
     if (lang === "typescript") {
       if (selectedEndpoint.method === "GET") {
-        return `const response = await fetch("${url}", {\n  headers: { "Authorization": "Bearer ${token}" }\n});\nconst data = await response.json();\nconsole.log(data);`;
+        return `const response = await fetch("${fullUrl}", {\n  method: "GET",\n  headers: {\n    "Authorization": "Bearer ${token}"\n  }\n});\nconst data = await response.json();\nconsole.log(data);`;
       }
-      return `const response = await fetch("${url}", {\n  method: "POST",\n  headers: {\n    "Authorization": "Bearer ${token}",\n    "Content-Type": "application/json"\n  },\n  body: JSON.stringify(${requestBody || "{}"})\n});\nconst data = await response.json();\nconsole.log(data);`;
+      return `const response = await fetch("${fullUrl}", {\n  method: "POST",\n  headers: {\n    "Content-Type": "application/json",\n    "Authorization": "Bearer ${token}"\n  },\n  body: JSON.stringify(${requestBody || "{}"})\n});\nconst data = await response.json();\nconsole.log(data);`;
     }
 
     if (lang === "rust") {
-      return `use reqwest::Client;\nuse serde_json::json;\n\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = Client::new();\n    let res = client\n        .post("${url}")\n        .bearer_auth("${token}")\n        .json(&json!(${requestBody || "{}"}))\n        .send()\n        .await?\n        .text()\n        .await?;\n    println!("{res}");\n    Ok(())\n}`;
+      return `use reqwest::Client;\n\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let client = Client::new();\n    let resp = client.post("${fullUrl}")\n        .header("Authorization", "Bearer ${token}")\n        .json(&serde_json::json!(${requestBody || "{}"}))\n        .send()\n        .await?;\n    \n    println!("Status: {}", resp.status());\n    println!("Body: {}", resp.text().await?);\n    Ok(())\n}`;
+    }
+
+    if (lang === "golang") {
+      return `package main\n\nimport (\n    "bytes"\n    "fmt"\n    "io"\n    "net/http"\n)\n\nfunc main() {\n    url := "${fullUrl}"\n    payload := []byte(\`${requestBody || "{}"}\`)\n    req, _ := http.NewRequest("POST", url, bytes.NewBuffer(payload))\n    req.Header.Set("Content-Type", "application/json")\n    req.Header.Set("Authorization", "Bearer ${token}")\n\n    client := &http.Client{}\n    resp, err := client.Do(req)\n    if err != nil {\n        panic(err)\n    }\n    defer resp.Body.Close()\n    body, _ := io.ReadAll(resp.Body)\n    fmt.Println(string(body))\n}`;
     }
 
     return "";
   }
 
-  function copyCode(text: string, label: string) {
+  function copyCode(text: string, tabName: string) {
+    if (!navigator.clipboard) return;
     navigator.clipboard.writeText(text);
-    setCopiedTab(label);
+    setCopiedTab(tabName);
     setTimeout(() => setCopiedTab(null), 2000);
   }
 
@@ -488,12 +460,12 @@ export default function ApiDocsPage() {
     const spec = {
       openapi: "3.0.3",
       info: {
-        title: "Router API AI",
-        version: "0.1.0",
+        title: "Router AI Intelligent Multimodal Gateway",
+        version: "1.0.0",
         description:
-          "High-performance AI router gateway with multi-provider scaling (NVIDIA NIM, Groq, Local CLI Agents) and Multimodal License Plate OCR.",
+          "High-performance AI Gateway proxying OpenAI-compatible Chat completions, NVIDIA NIM Vision models, and ALPR License Plate Recognition with local failover.",
       },
-      servers: [{ url: "http://127.0.0.1:5790" }],
+      servers: [{ url: "/" }],
       paths: {
         "/api/v1/chat/completions": {
           post: {
@@ -507,6 +479,28 @@ export default function ApiDocsPage() {
               },
             },
             responses: { "200": { description: "Successful Completion" } },
+          },
+        },
+        "/api/v1/ocr/description": {
+          post: {
+            summary: "Visual Description & OCR Analysis",
+            security: [{ BearerAuth: [] }],
+            requestBody: {
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["image"],
+                    properties: {
+                      image: { type: "string" },
+                      instruction: { type: "string" },
+                      model: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            responses: { "200": { description: "Structured Description & OCR" } },
           },
         },
         "/api/v1/ocr/licenseplate": {
@@ -548,47 +542,47 @@ export default function ApiDocsPage() {
   return (
     <Shell>
       <div className="flex flex-col gap-6">
+        {/* Page Title & Export */}
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-zinc-100">
-              API Documentation & Swagger Playground
+            <h1 className="text-xl font-bold tracking-tight text-slate-900">
+              API Documentation &amp; Swagger Console
             </h1>
-            <p className="mt-1 text-sm text-zinc-400">
-              Interactive OpenAPI reference, live testing console, and code
-              generator for router-api-ai.
+            <p className="mt-1 text-xs text-slate-500">
+              Interactive OpenAPI reference, live testing console, and multi-language client snippets.
             </p>
           </div>
           <button
             onClick={downloadOpenApiSpec}
-            className="flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/80 px-3 py-2 text-xs font-medium text-zinc-200 transition-colors hover:bg-zinc-700 hover:text-white"
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 shadow-xs transition-all hover:bg-slate-50 hover:text-slate-900"
           >
-            Download OpenAPI 3.0 (JSON)
+            <span>📥</span>
+            <span>Download OpenAPI 3.0</span>
           </button>
         </div>
 
         {/* Global Key Input */}
-        <Card className="bg-zinc-900/40">
+        <Card>
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+              <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                 Authorization Token
               </span>
               <Badge tone={apiKey ? "green" : "amber"}>
-                {apiKey ? "Configured" : "Not Set"}
+                {apiKey ? "Configured" : "Unset"}
               </Badge>
             </div>
-            <div className="flex-1 min-w-[280px]">
+            <div className="min-w-[280px] flex-1">
               <input
                 type="text"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder="sk-router-... or master key"
-                className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-1.5 font-mono text-xs text-slate-900 outline-none transition-all placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               />
             </div>
-            <p className="text-xs text-zinc-500">
-              Used automatically in the Authorization Bearer header for live
-              testing.
+            <p className="text-xs text-slate-400">
+              Injected automatically into the Bearer auth header for live requests.
             </p>
           </div>
         </Card>
@@ -597,40 +591,38 @@ export default function ApiDocsPage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
           {/* Endpoint Sidebar */}
           <div className="flex flex-col gap-2 lg:col-span-4">
-            <h2 className="px-1 text-xs font-bold uppercase tracking-wider text-zinc-500">
+            <h2 className="px-1 text-xs font-semibold uppercase tracking-wider text-slate-400">
               Endpoints
             </h2>
-            <div className="flex flex-col gap-1.5 overflow-y-auto max-h-[700px] pr-1">
+            <div className="flex max-h-[720px] flex-col gap-2 overflow-y-auto pr-1">
               {ENDPOINTS.map((ep) => {
                 const selected = selectedEndpoint.id === ep.id;
-                const methodColor =
+                const methodBadgeTone =
                   ep.method === "POST"
-                    ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
+                    ? "green"
                     : ep.method === "GET"
-                      ? "text-sky-400 bg-sky-500/10 border-sky-500/30"
-                      : "text-zinc-400 bg-zinc-800 border-zinc-700";
+                      ? "blue"
+                      : "zinc";
 
                 return (
                   <button
                     key={ep.id}
                     onClick={() => handleSelectEndpoint(ep)}
-                    className={`flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors ${
+                    className={`flex flex-col gap-1 rounded-xl border p-3.5 text-left transition-all ${
                       selected
-                        ? "border-emerald-500/60 bg-zinc-900 shadow-md"
-                        : "border-zinc-800/80 bg-zinc-900/30 hover:border-zinc-700 hover:bg-zinc-900/60"
+                        ? "border-indigo-500 bg-indigo-50/70 shadow-xs ring-1 ring-indigo-500/20"
+                        : "border-slate-200/90 bg-white shadow-xs hover:border-slate-300 hover:bg-slate-50/60"
                     }`}
                   >
                     <div className="flex items-center gap-2">
-                      <span
-                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-bold ${methodColor}`}
-                      >
+                      <Badge tone={methodBadgeTone}>
                         {ep.method}
-                      </span>
-                      <span className="font-mono text-xs font-semibold text-zinc-200">
+                      </Badge>
+                      <span className="font-mono text-xs font-semibold text-slate-800">
                         {ep.path}
                       </span>
                     </div>
-                    <p className="text-xs text-zinc-400 line-clamp-1">
+                    <p className="text-xs text-slate-500 line-clamp-1">
                       {ep.summary}
                     </p>
                   </button>
@@ -643,23 +635,21 @@ export default function ApiDocsPage() {
           <div className="flex flex-col gap-6 lg:col-span-8">
             <Card>
               {/* Endpoint Header */}
-              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-800 pb-4">
+              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-4">
                 <div className="flex flex-col gap-1.5">
                   <div className="flex items-center gap-2">
-                    <span
-                      className={`rounded px-2 py-0.5 font-mono text-xs font-bold ${
-                        selectedEndpoint.method === "POST"
-                          ? "bg-emerald-500/20 text-emerald-400"
-                          : "bg-sky-500/20 text-sky-400"
-                      }`}
+                    <Badge
+                      tone={
+                        selectedEndpoint.method === "POST" ? "green" : "blue"
+                      }
                     >
                       {selectedEndpoint.method}
-                    </span>
-                    <span className="font-mono text-sm font-bold text-zinc-100">
+                    </Badge>
+                    <span className="font-mono text-sm font-bold text-slate-900">
                       {selectedEndpoint.path}
                     </span>
                   </div>
-                  <p className="text-sm text-zinc-300">
+                  <p className="text-xs text-slate-600">
                     {selectedEndpoint.description}
                   </p>
                 </div>
@@ -674,14 +664,14 @@ export default function ApiDocsPage() {
               {selectedEndpoint.presets &&
                 selectedEndpoint.presets.length > 0 && (
                   <div className="mt-4 flex flex-wrap items-center gap-2">
-                    <span className="text-xs font-medium text-zinc-400">
-                      Quick Presets:
+                    <span className="text-xs font-semibold text-slate-500">
+                      Presets:
                     </span>
                     {selectedEndpoint.presets.map((preset) => (
                       <button
                         key={preset.name}
                         onClick={() => handlePreset(preset.body)}
-                        className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200 transition-colors hover:border-emerald-500 hover:text-emerald-400"
+                        className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 shadow-xs transition-colors hover:border-indigo-400 hover:bg-white hover:text-indigo-700"
                       >
                         {preset.name}
                       </button>
@@ -692,14 +682,14 @@ export default function ApiDocsPage() {
               {/* Request Body Editor */}
               {selectedEndpoint.method !== "GET" && (
                 <div className="mt-4 flex flex-col gap-2">
-                  <label className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                  <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                     Request Body (JSON)
                   </label>
                   <textarea
                     rows={8}
                     value={requestBody}
                     onChange={(e) => setRequestBody(e.target.value)}
-                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none"
+                    className="w-full rounded-xl border border-slate-300 bg-slate-50/50 p-3.5 font-mono text-xs text-slate-900 outline-none transition-all placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
                   />
                 </div>
               )}
@@ -709,21 +699,21 @@ export default function ApiDocsPage() {
                 <button
                   onClick={executeRequest}
                   disabled={loading}
-                  className="flex items-center gap-2 rounded-lg bg-emerald-500 px-5 py-2 font-medium text-sm text-zinc-950 transition-colors hover:bg-emerald-400 disabled:opacity-50 font-semibold"
+                  className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-xs transition-all hover:bg-indigo-700 hover:shadow-sm disabled:opacity-50"
                 >
                   {loading ? (
                     <>
-                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-zinc-900 border-t-transparent" />
-                      Executing...
+                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                      <span>Sending payload...</span>
                     </>
                   ) : (
-                    "Send Request"
+                    <span>Send Request ⚡</span>
                   )}
                 </button>
                 {responseDuration !== null && (
-                  <span className="font-mono text-xs text-zinc-400">
+                  <span className="font-mono text-xs text-slate-500">
                     Latency:{" "}
-                    <strong className="text-zinc-200">
+                    <strong className="text-slate-900">
                       {responseDuration} ms
                     </strong>
                   </span>
@@ -732,9 +722,9 @@ export default function ApiDocsPage() {
 
               {/* Response Section */}
               {responseStatus !== null && (
-                <div className="mt-6 flex flex-col gap-2 border-t border-zinc-800 pt-4">
+                <div className="mt-6 flex flex-col gap-2.5 border-t border-slate-100 pt-4">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold uppercase tracking-wider text-zinc-400">
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
                       Response Output
                     </span>
                     <Badge
@@ -749,7 +739,7 @@ export default function ApiDocsPage() {
                       Status {responseStatus}
                     </Badge>
                   </div>
-                  <pre className="max-h-96 overflow-auto rounded-lg border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200">
+                  <pre className="max-h-96 overflow-auto rounded-xl border border-slate-200 bg-slate-900 p-4 font-mono text-xs leading-relaxed text-emerald-400 shadow-inner">
                     {responseBody}
                   </pre>
                 </div>
@@ -759,34 +749,40 @@ export default function ApiDocsPage() {
             {/* Code Snippets Generator */}
             <Card title="Client Code Snippets">
               <div className="flex flex-col gap-3">
-                <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
-                  <div className="flex gap-2">
-                    {(["curl", "python", "typescript", "rust"] as const).map(
-                      (lang) => (
-                        <button
-                          key={lang}
-                          onClick={() => setActiveLang(lang)}
-                          className={`rounded px-2.5 py-1 text-xs font-semibold transition-colors ${
-                            activeLang === lang
-                              ? "bg-zinc-800 text-emerald-400"
-                              : "text-zinc-400 hover:text-zinc-200"
-                          }`}
-                        >
-                          {lang.toUpperCase()}
-                        </button>
-                      ),
-                    )}
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                  <div className="flex gap-1.5">
+                    {(
+                      [
+                        "curl",
+                        "python",
+                        "typescript",
+                        "rust",
+                        "golang",
+                      ] as const
+                    ).map((lang) => (
+                      <button
+                        key={lang}
+                        onClick={() => setActiveLang(lang)}
+                        className={`rounded-lg px-3 py-1 text-xs font-semibold transition-all ${
+                          activeLang === lang
+                            ? "bg-indigo-50 text-indigo-700 shadow-xs ring-1 ring-indigo-500/20"
+                            : "text-slate-500 hover:bg-slate-50 hover:text-slate-900"
+                        }`}
+                      >
+                        {lang.toUpperCase()}
+                      </button>
+                    ))}
                   </div>
                   <button
                     onClick={() =>
                       copyCode(generateSnippet(activeLang), activeLang)
                     }
-                    className="text-xs text-zinc-400 hover:text-white"
+                    className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
                   >
-                    {copiedTab === activeLang ? "Copied!" : "Copy Code"}
+                    {copiedTab === activeLang ? "✓ Copied" : "📋 Copy"}
                   </button>
                 </div>
-                <pre className="overflow-x-auto rounded-lg bg-zinc-950 p-3 font-mono text-xs text-zinc-300">
+                <pre className="overflow-x-auto rounded-xl border border-slate-200 bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-100 shadow-inner">
                   {generateSnippet(activeLang)}
                 </pre>
               </div>

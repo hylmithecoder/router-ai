@@ -118,41 +118,48 @@ export default function ProvidersPage() {
     <Shell>
       <div className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-xl font-semibold">Providers &amp; keys</h1>
-          <p className="mt-1 text-sm text-zinc-500">
-            Add Groq and NVIDIA keys; the router automatically fails over and routes by model or provider.
+          <h1 className="text-xl font-bold tracking-tight text-slate-900">Providers &amp; Upstreams</h1>
+          <p className="mt-1 text-xs text-slate-500">
+            Configure Groq and NVIDIA credentials; requests automatically fail over and route by model modality.
           </p>
         </div>
-        <p className="text-xs text-zinc-600">Secrets are encrypted in SQLite and never shown again.</p>
+        <p className="text-xs font-medium text-slate-400">Credentials are encrypted at rest with AES-256-GCM.</p>
       </div>
 
       {error && <ErrorBox message={error} />}
 
-      <div className="mb-6 grid grid-cols-1 gap-6 xl:grid-cols-[340px_1fr]">
-        <Card title="Add HTTP upstream key">
-          <form onSubmit={create} className="flex flex-col gap-3">
+      <div className="mb-6 grid grid-cols-1 gap-6 xl:grid-cols-[360px_1fr]">
+        {/* Add Key Card */}
+        <Card title="Add upstream provider key">
+          <form onSubmit={create} className="flex flex-col gap-4">
             <div>
-              <label className="mb-1 block text-xs text-zinc-500">Provider Type</label>
+              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Provider Type
+              </label>
               <select
                 value={kind}
                 onChange={(e) => onKindChange(e.target.value as "groq" | "nvidia")}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 outline-none focus:border-emerald-500"
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-2 text-sm text-slate-900 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               >
-                <option value="groq">Groq (Llama, Mixtral)</option>
-                <option value="nvidia">NVIDIA NIM (Nemotron, Omni)</option>
+                <option value="groq">Groq (Llama 3.3, Qwen 3.6, Mixtral)</option>
+                <option value="nvidia">NVIDIA NIM (Nemotron, Gemma, MiniMax)</option>
               </select>
             </div>
+
             <div>
-              <label className="mb-1 block text-xs text-zinc-500">Label (optional)</label>
+              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Label (optional)
+              </label>
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder={kind === "nvidia" ? "NVIDIA Nemotron 01" : "Groq production 03"}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none placeholder:text-zinc-600 focus:border-emerald-500"
+                placeholder={kind === "nvidia" ? "e.g. NVIDIA Nemotron Primary" : "e.g. Groq Production 01"}
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-2 text-sm text-slate-900 outline-none transition-all placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               />
             </div>
+
             <div>
-              <label className="mb-1 block text-xs text-zinc-500">
+              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-500">
                 {kind === "nvidia" ? "NVIDIA API key" : "Groq API key"}
               </label>
               <input
@@ -161,39 +168,47 @@ export default function ProvidersPage() {
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={kind === "nvidia" ? "nvapi-…" : "gsk_…"}
                 required
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm outline-none placeholder:text-zinc-600 focus:border-emerald-500"
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-2 font-mono text-sm text-slate-900 outline-none transition-all placeholder:text-slate-400 focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               />
             </div>
+
             <div>
-              <label className="mb-1 block text-xs text-zinc-500">Base URL</label>
+              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Base URL
+              </label>
               <input
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs outline-none focus:border-emerald-500"
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-2 font-mono text-xs text-slate-900 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               />
             </div>
+
             <div>
-              <label className="mb-1 block text-xs text-zinc-500">Default model</label>
+              <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Default model
+              </label>
               <input
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-xs outline-none focus:border-emerald-500"
+                className="w-full rounded-lg border border-slate-300 bg-slate-50/50 px-3 py-2 font-mono text-xs text-slate-900 outline-none transition-all focus:border-indigo-500 focus:bg-white focus:ring-2 focus:ring-indigo-500/20"
               />
             </div>
+
             <button
               type="submit"
               disabled={busy || !apiKey.trim()}
-              className="rounded-lg bg-emerald-500 py-2 text-sm font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 disabled:opacity-40"
+              className="mt-2 rounded-lg bg-indigo-600 py-2.5 text-sm font-semibold text-white shadow-xs transition-all hover:bg-indigo-700 hover:shadow-sm disabled:opacity-40"
             >
-              {busy ? "Saving…" : `Save ${kind === "nvidia" ? "NVIDIA" : "Groq"} key`}
+              {busy ? "Saving…" : `Save ${kind === "nvidia" ? "NVIDIA" : "Groq"} credential`}
             </button>
           </form>
         </Card>
 
-        <Card title={`Configured providers (${providers?.length ?? "…"})`}>
+        {/* Configured Providers Card */}
+        <Card title={`Configured upstream nodes (${providers?.length ?? "…"})`}>
           {!providers && <Spinner />}
           {providers && (
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {providers.map((provider) => {
                 const cooldown = cooldownLeft(provider.cooldown_until);
                 const isHttp = provider.kind === "groq" || provider.kind === "nvidia";
@@ -216,55 +231,55 @@ export default function ProvidersPage() {
                         ? "healthy"
                         : "failing";
                 return (
-                  <div key={provider.id} className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                  <div key={provider.id} className="rounded-xl border border-slate-200/90 bg-white p-4 shadow-xs">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="font-semibold text-zinc-200">{provider.name}</p>
-                        <p className="mt-0.5 font-mono text-[11px] text-zinc-600">{provider.id}</p>
+                        <p className="font-semibold text-slate-900">{provider.name}</p>
+                        <p className="mt-0.5 font-mono text-[11px] text-slate-400">{provider.id}</p>
                       </div>
                       <Badge tone={statusTone}>{statusText}</Badge>
                     </div>
 
-                    <dl className="mt-4 space-y-1.5 text-xs">
+                    <dl className="mt-4 space-y-2 text-xs">
                       <div className="flex justify-between gap-4">
-                        <dt className="text-zinc-500">Type</dt>
-                        <dd className="text-zinc-300">{providerLabel(provider)}</dd>
+                        <dt className="text-slate-400">Type</dt>
+                        <dd className="font-medium text-slate-700">{providerLabel(provider)}</dd>
                       </div>
                       <div className="flex justify-between gap-4">
-                        <dt className="text-zinc-500">Model</dt>
-                        <dd className="max-w-[65%] truncate font-mono text-zinc-300">
+                        <dt className="text-slate-400">Model</dt>
+                        <dd className="max-w-[65%] truncate font-mono font-medium text-slate-800">
                           {provider.model || "default"}
                         </dd>
                       </div>
                       {isHttp ? (
                         <div className="flex justify-between gap-4">
-                          <dt className="text-zinc-500">Credential</dt>
-                          <dd className="font-mono text-emerald-400">
-                            {provider.api_key_configured ? "encrypted / configured" : "missing"}
+                          <dt className="text-slate-400">Credential</dt>
+                          <dd className="font-mono text-emerald-600 font-semibold">
+                            {provider.api_key_configured ? "encrypted / active" : "missing"}
                           </dd>
                         </div>
                       ) : (
                         <div className="flex justify-between gap-4">
-                          <dt className="text-zinc-500">Binary</dt>
-                          <dd className="max-w-[65%] truncate font-mono text-zinc-400">
+                          <dt className="text-slate-400">Binary</dt>
+                          <dd className="max-w-[65%] truncate font-mono text-slate-600">
                             {provider.command ?? "not configured"}
                           </dd>
                         </div>
                       )}
                       <div className="flex justify-between gap-4">
-                        <dt className="text-zinc-500">Failures</dt>
-                        <dd className="font-mono text-zinc-300">{provider.failure_count}</dd>
+                        <dt className="text-slate-400">Failures</dt>
+                        <dd className="font-mono text-slate-700">{provider.failure_count}</dd>
                       </div>
                       <div className="flex justify-between gap-4">
-                        <dt className="text-zinc-500">Last used</dt>
-                        <dd className="font-mono text-zinc-400">
+                        <dt className="text-slate-400">Last used</dt>
+                        <dd className="font-mono text-slate-600">
                           {provider.last_used_at ? formatTime(provider.last_used_at) : "never"}
                         </dd>
                       </div>
                     </dl>
 
                     {provider.last_error && (
-                      <p className="mt-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 font-mono text-[11px] leading-relaxed text-red-400">
+                      <p className="mt-3 rounded-lg border border-rose-200 bg-rose-50/80 px-3 py-2 font-mono text-[11px] leading-relaxed text-rose-700">
                         {provider.last_error}
                       </p>
                     )}
@@ -272,14 +287,14 @@ export default function ProvidersPage() {
                     <div className="mt-4 flex gap-2">
                       <button
                         onClick={() => toggle(provider)}
-                        className="flex-1 rounded-lg border border-zinc-700 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-800"
+                        className="flex-1 rounded-lg border border-slate-200 bg-white py-1.5 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
                       >
                         {provider.enabled ? "Disable" : "Enable"}
                       </button>
                       {isHttp && (
                         <button
                           onClick={() => remove(provider)}
-                          className="rounded-lg border border-red-500/30 px-3 py-1.5 text-sm text-red-400 transition-colors hover:bg-red-500/10"
+                          className="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-600 shadow-xs transition-colors hover:bg-rose-50"
                         >
                           Delete
                         </button>
@@ -290,8 +305,8 @@ export default function ProvidersPage() {
               })}
 
               {providers.length === 0 && (
-                <p className="py-10 text-center text-sm text-zinc-500 md:col-span-2">
-                  No providers configured. Add a Groq key or configure the server on a host with an agent CLI.
+                <p className="py-12 text-center text-sm font-medium text-slate-400 md:col-span-2">
+                  No upstream providers configured yet.
                 </p>
               )}
             </div>
@@ -299,9 +314,9 @@ export default function ProvidersPage() {
         </Card>
       </div>
 
-      <Card title="Local agent safety">
-        <p className="text-sm leading-relaxed text-zinc-400">
-          OpenCode, Codex CLI, Claude Code, and Agy are detected from the router host&apos;s PATH. The router invokes them non-interactively with bounded timeouts; Codex and Agy use sandbox modes, Claude runs with tools disabled, and the prompt explicitly forbids file or command changes.
+      <Card title="Agent CLI Sandbox &amp; Safety">
+        <p className="text-xs leading-relaxed text-slate-600">
+          OpenCode, Codex CLI, Claude Code, and Agy are detected from the router host&apos;s system PATH. The router invokes them non-interactively with bounded timeouts; Codex and Agy use sandbox isolation modes, Claude runs with tools disabled, and all system prompts explicitly forbid unauthorized file system or command alterations.
         </p>
       </Card>
     </Shell>

@@ -37,19 +37,22 @@ export default function UsagePage() {
   return (
     <Shell>
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="text-xl font-semibold">Usage log</h1>
+        <div>
+          <h1 className="text-xl font-bold tracking-tight text-slate-900">Usage log</h1>
+          <p className="text-xs text-slate-500">Historical API requests, token consumption, and response status</p>
+        </div>
         <div className="flex gap-2">
           <button
             disabled={offset === 0}
             onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-            className="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-lg border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-700 shadow-xs transition-all hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
           >
             ← Newer
           </button>
           <button
             disabled={!rows || rows.length < PAGE_SIZE}
             onClick={() => setOffset((o) => o + PAGE_SIZE)}
-            className="rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-lg border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-semibold text-slate-700 shadow-xs transition-all hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Older →
           </button>
@@ -60,10 +63,10 @@ export default function UsagePage() {
       {!rows && !error && <Spinner />}
 
       {rows && (
-        <div className="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/60">
+        <div className="overflow-x-auto rounded-xl border border-slate-200/90 bg-white shadow-xs">
           <table className="w-full min-w-[760px] text-sm">
             <thead>
-              <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wider text-zinc-500">
+              <tr className="border-b border-slate-200/90 bg-slate-50/75 text-left text-xs font-semibold uppercase tracking-wider text-slate-500">
                 <th className="px-4 py-3">Time</th>
                 <th className="px-4 py-3">Key</th>
                 <th className="px-4 py-3">Model</th>
@@ -73,28 +76,28 @@ export default function UsagePage() {
                 <th className="px-4 py-3">Status</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-zinc-800/60">
+            <tbody className="divide-y divide-slate-100">
               {rows.map((r) => (
-                <tr key={r.id} className="hover:bg-zinc-800/40">
-                  <td className="whitespace-nowrap px-4 py-2.5 font-mono text-xs text-zinc-400">
+                <tr key={r.id} className="transition-colors hover:bg-slate-50/75">
+                  <td className="whitespace-nowrap px-4 py-3 font-mono text-xs text-slate-500">
                     {formatTime(r.created_at)}
                   </td>
-                  <td className="px-4 py-2.5 text-zinc-300">{r.key_name}</td>
-                  <td className="px-4 py-2.5 font-mono text-xs text-zinc-400">
+                  <td className="px-4 py-3 font-medium text-slate-800">{r.key_name}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-slate-600">
                     {r.model}
                   </td>
-                  <td className="px-4 py-2.5 font-mono text-xs text-zinc-400">
+                  <td className="px-4 py-3 font-mono text-xs text-slate-600">
                     {r.provider}
                   </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-zinc-300">
+                  <td className="px-4 py-3 text-right font-mono text-xs font-semibold text-slate-900">
                     {formatTokens(r.total_tokens)}
                   </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-xs text-zinc-400">
+                  <td className="px-4 py-3 text-right font-mono text-xs text-slate-500">
                     {formatDuration(r.latency_ms)}
                   </td>
-                  <td className="px-4 py-2.5">
+                  <td className="px-4 py-3">
                     {r.status === 200 ? (
-                      <Badge tone="green">200</Badge>
+                      <Badge tone="green">200 OK</Badge>
                     ) : (
                       <Badge tone="red">{r.status}</Badge>
                     )}
@@ -103,8 +106,8 @@ export default function UsagePage() {
               ))}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-10 text-center text-zinc-500">
-                    no requests recorded yet
+                  <td colSpan={7} className="py-12 text-center text-sm font-medium text-slate-400">
+                    No requests recorded yet
                   </td>
                 </tr>
               )}
