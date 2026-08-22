@@ -252,7 +252,21 @@ const ENDPOINTS: ApiEndpoint[] = [
     ),
     presets: [
       {
-        name: "Auto-Pick Model (Smart)",
+        name: "⚡ Local Fast ALPR (Millisecond <100ms)",
+        body: JSON.stringify(
+          {
+            image:
+              "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
+            instruction:
+              "Ekstrak plat nomor kendaraan dan tipe kendaraan dengan teliti.",
+            model: "fast",
+          },
+          null,
+          2,
+        ),
+      },
+      {
+        name: "Auto-Pick Model (Smart Cloud)",
         body: JSON.stringify(
           {
             image:

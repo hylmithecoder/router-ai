@@ -42,6 +42,21 @@ pub async fn license_plate_ocr(
         return Err(AppError::Validation("image field is required".to_string()));
     }
 
+    let started = std::time::Instant::now();
+    let is_fast_local = matches!(
+        req.model.as_deref().map(|s| s.to_lowercase()).as_deref(),
+        Some("local") | Some("fast") | Some("fast-alpr") | Some("local-alpr") | Some("onnx")
+    );
+
+    if is_fast_local {
+        match try_local_alpr_fallback(&state, image_input, &auth.id, started).await {
+            Ok(resp) => return Ok(Json(resp)),
+            Err(err) => {
+                tracing::warn!("explicit fast local alpr execution failed: {err}, continuing to cloud vision");
+            }
+        }
+    }
+
     let image_url = normalize_image_url(image_input);
     let prompt = build_ocr_prompt(req.instruction.as_deref());
 
@@ -88,7 +103,6 @@ pub async fn license_plate_ocr(
         provider: req.provider.clone(),
     };
 
-    let started = std::time::Instant::now();
     match state.router.complete(&chat_req).await {
         Ok(outcome) => {
             let content = outcome
