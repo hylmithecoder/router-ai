@@ -4,6 +4,16 @@ import { useState, useEffect } from "react";
 import Shell from "@/components/Shell";
 import { Badge, Card } from "@/components/ui";
 import { getMasterKey } from "@/lib/api";
+import {
+  LuDownload,
+  LuCopy,
+  LuCheck,
+  LuSend,
+  LuKey,
+  LuCode,
+  LuZap,
+  LuFileText,
+} from "react-icons/lu";
 
 interface ApiEndpoint {
   id: string;
@@ -556,7 +566,7 @@ export default function DocsPage() {
             onClick={downloadOpenApiSpec}
             className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 shadow-xs transition-all hover:bg-slate-50 hover:text-slate-900"
           >
-            <span>📥</span>
+            <LuDownload className="h-4 w-4 text-slate-500" />
             <span>Download OpenAPI 3.0</span>
           </button>
         </div>
@@ -565,6 +575,7 @@ export default function DocsPage() {
         <Card>
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-2">
+              <LuKey className="h-4 w-4 text-slate-400" />
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                 Authorization Token
               </span>
@@ -582,7 +593,7 @@ export default function DocsPage() {
               />
             </div>
             <p className="text-xs text-slate-400">
-              Injected automatically into the Bearer auth header for live requests.
+              Injected automatically into Bearer header for live request execution.
             </p>
           </div>
         </Card>
@@ -591,9 +602,12 @@ export default function DocsPage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
           {/* Endpoint Sidebar */}
           <div className="flex flex-col gap-2 lg:col-span-4">
-            <h2 className="px-1 text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Endpoints
-            </h2>
+            <div className="flex items-center gap-2 px-1">
+              <LuFileText className="h-3.5 w-3.5 text-slate-400" />
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                Endpoints
+              </h2>
+            </div>
             <div className="flex max-h-[720px] flex-col gap-2 overflow-y-auto pr-1">
               {ENDPOINTS.map((ep) => {
                 const selected = selectedEndpoint.id === ep.id;
@@ -664,9 +678,10 @@ export default function DocsPage() {
               {selectedEndpoint.presets &&
                 selectedEndpoint.presets.length > 0 && (
                   <div className="mt-4 flex flex-wrap items-center gap-2">
-                    <span className="text-xs font-semibold text-slate-500">
-                      Presets:
-                    </span>
+                    <div className="flex items-center gap-1 text-xs font-semibold text-slate-500">
+                      <LuZap className="h-3.5 w-3.5 text-amber-500" />
+                      <span>Presets:</span>
+                    </div>
                     {selectedEndpoint.presets.map((preset) => (
                       <button
                         key={preset.name}
@@ -699,7 +714,7 @@ export default function DocsPage() {
                 <button
                   onClick={executeRequest}
                   disabled={loading}
-                  className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-xs transition-all hover:bg-indigo-700 hover:shadow-sm disabled:opacity-50"
+                  className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-xs transition-all hover:bg-indigo-700 hover:shadow-sm disabled:opacity-50"
                 >
                   {loading ? (
                     <>
@@ -707,7 +722,10 @@ export default function DocsPage() {
                       <span>Sending payload...</span>
                     </>
                   ) : (
-                    <span>Send Request ⚡</span>
+                    <>
+                      <LuSend className="h-3.5 w-3.5" />
+                      <span>Send Request</span>
+                    </>
                   )}
                 </button>
                 {responseDuration !== null && (
@@ -750,7 +768,8 @@ export default function DocsPage() {
             <Card title="Client Code Snippets">
               <div className="flex flex-col gap-3">
                 <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-                  <div className="flex gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <LuCode className="h-4 w-4 text-indigo-600 mr-1" />
                     {(
                       [
                         "curl",
@@ -779,7 +798,17 @@ export default function DocsPage() {
                     }
                     className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
                   >
-                    {copiedTab === activeLang ? "✓ Copied" : "📋 Copy"}
+                    {copiedTab === activeLang ? (
+                      <>
+                        <LuCheck className="h-3.5 w-3.5 text-emerald-600" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <LuCopy className="h-3.5 w-3.5" />
+                        <span>Copy Code</span>
+                      </>
+                    )}
                   </button>
                 </div>
                 <pre className="overflow-x-auto rounded-xl border border-slate-200 bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-100 shadow-inner">

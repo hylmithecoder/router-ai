@@ -1,3 +1,5 @@
+import { LuCircleAlert } from "react-icons/lu";
+
 export function Card({
   title,
   children,
@@ -71,8 +73,8 @@ export function Spinner() {
 export function ErrorBox({ message }: { message: string }) {
   return (
     <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-4 text-sm text-rose-700 shadow-xs">
-      <div className="flex items-center gap-2">
-        <span className="text-base">⚠️</span>
+      <div className="flex items-center gap-2.5">
+        <LuCircleAlert className="h-4 w-4 shrink-0 text-rose-600" />
         <span className="font-medium">{message}</span>
       </div>
     </div>
