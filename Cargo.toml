@@ -36,6 +36,7 @@ thiserror = "2.0"
 # Common domain types.
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.16", features = ["v4", "serde"] }
+base64 = "0.22"
 
 # HTTP client for proxying to upstream providers.
 # rustls-tls (bukan native-tls/openssl) agar binary bisa fully static.

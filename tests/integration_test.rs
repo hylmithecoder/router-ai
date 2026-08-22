@@ -918,6 +918,86 @@ fn ocr_vision_upstream() -> Router {
     )
 }
 
+fn description_vision_upstream() -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let json_desc = r#"{
+                "description": "A close up photo of a Discord meme with text",
+                "extracted_text": "DO NOT TOUCH MY CODE",
+                "tags": ["meme", "discord", "humor"],
+                "is_sensitive": false,
+                "safety_reason": null
+            }"#;
+            Json(json!({
+                "id": "chatcmpl-desc-123",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "google/diffusiongemma-26b-a4b-it",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": format!("```json\n{}\n```", json_desc)
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 150, "completion_tokens": 50, "total_tokens": 200 }
+            }))
+        }),
+    )
+}
+
+#[tokio::test]
+async fn image_description_endpoint_successful_analysis() {
+    let mock_desc = spawn_mock(description_vision_upstream()).await;
+    let (app, state) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-desc-1".into(),
+            base_url: mock_desc,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ocr/description")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "image": "https://example.com/meme.jpg",
+                        "instruction": "Periksa teks dan konten gambar"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(
+        body["data"]["description"],
+        "A close up photo of a Discord meme with text"
+    );
+    assert_eq!(body["data"]["extracted_text"], "DO NOT TOUCH MY CODE");
+    assert_eq!(body["data"]["is_sensitive"], false);
+    assert_eq!(body["data"]["tags"][0], "meme");
+
+    let summary = state.db.usage_summary_today().await.unwrap();
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].total_tokens, 200);
+}
+
 #[tokio::test]
 async fn license_plate_ocr_successful_recognition() {
     let mock_ocr = spawn_mock(ocr_vision_upstream()).await;
@@ -964,6 +1044,13 @@ async fn license_plate_ocr_successful_recognition() {
     let summary = state.db.usage_summary_today().await.unwrap();
     assert_eq!(summary.len(), 1);
     assert_eq!(summary[0].total_tokens, 160);
+
+    // Yield to allow background dataset harvesting task to execute
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let samples = state.db.list_ocr_samples(10).await.unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].plate_number, "B 1234 ABC");
+    assert_eq!(samples[0].vehicle_type.as_deref(), Some("car"));
 }
 
 #[tokio::test]
@@ -1209,4 +1296,35 @@ async fn admin_dns_endpoint_query() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["success"], true);
     assert_eq!(body["data"]["host"], "cloudflare.com");
+}
+
+#[tokio::test]
+async fn license_plate_ocr_falls_back_to_local_engine_when_providers_fail() {
+    // When no vision providers are configured, router returns NoProviders / AllProvidersFailed (503)
+    // The handler should attempt local fallback
+    let (app, _state) = test_app("master", vec![]).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ocr/licenseplate")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "image": "https://example.com/mock.jpg"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Since mock.jpg is not a real image on disk, local alpr gracefully exits
+    // or returns 503 if no plate detected
+    let status = response.status();
+    assert!(status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE);
 }

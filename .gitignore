@@ -9,3 +9,12 @@ router.db
 # build output
 /dist
 IMPLEMENTATION_PLAN.md
+
+datasets/
+
+# Python & ML artifacts
+__pycache__/
+*.pyc
+runs/
+python-alpr-local/weights/
+

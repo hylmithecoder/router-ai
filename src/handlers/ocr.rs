@@ -18,8 +18,6 @@ use crate::{
     state::AppState,
 };
 
-use crate::ai::router::is_nvidia_model;
-
 /// Supported high-accuracy vision models for license plate OCR.
 pub const SUPPORTED_VISION_MODELS: &[&str] = &[
     "google/diffusiongemma-26b-a4b-it",
@@ -87,13 +85,7 @@ pub async fn license_plate_ocr(
         } else {
             None
         },
-        provider: req.provider.clone().or_else(|| {
-            if is_nvidia_model(&target_model) {
-                Some("nvidia".to_string())
-            } else {
-                Some("auto".to_string())
-            }
-        }),
+        provider: req.provider.clone(),
     };
 
     let started = std::time::Instant::now();
@@ -110,6 +102,14 @@ pub async fn license_plate_ocr(
                 &content,
                 &outcome.model,
                 &outcome.provider_name,
+            );
+
+            // Asynchronously harvest dataset sample for training & continuous evaluation
+            record_ocr_sample_background(
+                state.db.clone(),
+                state.http.clone(),
+                image_input.to_string(),
+                data.clone(),
             );
 
             let latency = started.elapsed().as_millis() as i64;
@@ -140,6 +140,15 @@ pub async fn license_plate_ocr(
                 }
                 RouterError::ClientError(msg) => (400, msg.clone()),
             };
+
+            // Attempt seamless fallback to Local ALPR Engine when upstream providers are down
+            if status == 503
+                && let Ok(fallback_resp) =
+                    try_local_alpr_fallback(&state, image_input, &auth.id, started).await
+            {
+                return Ok(Json(fallback_resp));
+            }
+
             let _ = state
                 .db
                 .insert_usage(
@@ -160,6 +169,158 @@ pub async fn license_plate_ocr(
             }
         }
     }
+}
+
+fn record_ocr_sample_background(
+    db: crate::database::Db,
+    client: reqwest::Client,
+    image_input: String,
+    data: LicensePlateData,
+) {
+    tokio::spawn(async move {
+        let sample_id = uuid::Uuid::new_v4().to_string();
+        let (filename, image_bytes) =
+            extract_image_bytes(&client, &image_input, &sample_id).await;
+
+        if let Some(bytes) = image_bytes {
+            let dir = std::path::Path::new("datasets/plates/images");
+            if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                tracing::warn!("failed to create datasets dir: {e}");
+            } else {
+                let file_path = dir.join(&filename);
+                if let Err(e) = tokio::fs::write(&file_path, bytes).await {
+                    tracing::warn!("failed to save dataset sample image: {e}");
+                }
+            }
+        }
+
+        let _ = db
+            .insert_ocr_sample(
+                &sample_id,
+                &filename,
+                &data.plate_number,
+                data.vehicle_type.as_deref(),
+                data.confidence.as_deref(),
+                data.raw_text.as_deref(),
+                data.description.as_deref(),
+                &data.model,
+                &data.provider,
+            )
+            .await;
+    });
+}
+
+async fn extract_image_bytes(
+    client: &reqwest::Client,
+    image_input: &str,
+    sample_id: &str,
+) -> (String, Option<Vec<u8>>) {
+    use base64::prelude::*;
+    let trimmed = image_input.trim();
+    if let Some(rest) = trimmed.strip_prefix("data:image/")
+        && let Some((mime, b64)) = rest.split_once(";base64,")
+    {
+        let ext = match mime {
+            "png" => "png",
+            "webp" => "webp",
+            _ => "jpg",
+        };
+        let filename = format!("{sample_id}.{ext}");
+        let bytes = BASE64_STANDARD.decode(b64.trim()).ok();
+        return (filename, bytes);
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let filename = format!("{sample_id}.jpg");
+        if let Ok(resp) = client
+            .get(trimmed)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            && resp.status().is_success()
+            && let Ok(bytes) = resp.bytes().await
+            && bytes.len() > 100
+        {
+            return (filename, Some(bytes.to_vec()));
+        }
+        return (filename, None);
+    }
+    let filename = format!("{sample_id}.jpg");
+    let bytes = BASE64_STANDARD.decode(trimmed).ok();
+    (filename, bytes)
+}
+
+async fn try_local_alpr_fallback(
+    state: &AppState,
+    image_input: &str,
+    auth_id: &str,
+    started: std::time::Instant,
+) -> Result<LicensePlateOcrResponse, String> {
+    let script_path = "python-alpr-local/main.py";
+    if !std::path::Path::new(script_path).exists() {
+        return Err("local alpr script python-alpr-local/main.py not found".to_string());
+    }
+
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.arg(script_path)
+        .arg("infer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn local alpr process: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(image_input.as_bytes()).await;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("local alpr execution failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("local alpr exited with error: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let clean = clean_json_codeblock(&stdout);
+
+    let data = parse_license_plate_output(&clean, "local-alpr-v1", "local");
+    if data.plate_number.is_empty() {
+        return Err("local alpr did not detect plate".to_string());
+    }
+
+    let latency = started.elapsed().as_millis() as i64;
+    let _ = state
+        .db
+        .insert_usage(
+            auth_id,
+            "local-alpr-v1",
+            "local",
+            0,
+            0,
+            latency,
+            StatusCode::OK.as_u16() as i64,
+        )
+        .await;
+
+    Ok(LicensePlateOcrResponse {
+        success: true,
+        data,
+        usage: crate::ai::dto::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
+    })
 }
 
 fn normalize_image_url(image_input: &str) -> String {

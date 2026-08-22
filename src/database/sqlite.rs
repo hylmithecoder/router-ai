@@ -151,6 +151,21 @@ pub struct StoredProvider {
     pub enabled: bool,
 }
 
+/// An OCR license plate dataset sample captured for training & benchmarking.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OcrSampleRow {
+    pub id: String,
+    pub image_filename: String,
+    pub plate_number: String,
+    pub vehicle_type: Option<String>,
+    pub confidence: Option<String>,
+    pub raw_text: Option<String>,
+    pub description: Option<String>,
+    pub model: String,
+    pub provider: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Shared database handle.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -234,6 +249,20 @@ impl Db {
                 last_error TEXT,
                 last_used_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS ocr_license_plate_samples (
+                id TEXT PRIMARY KEY,
+                image_filename TEXT NOT NULL,
+                plate_number TEXT NOT NULL,
+                vehicle_type TEXT,
+                confidence TEXT,
+                raw_text TEXT,
+                description TEXT,
+                model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ocr_samples_created ON ocr_license_plate_samples(created_at);
             "#,
         )?;
 
@@ -864,6 +893,82 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Record a license plate OCR sample to the dataset collection table.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_ocr_sample(
+        &self,
+        id: &str,
+        image_filename: &str,
+        plate_number: &str,
+        vehicle_type: Option<&str>,
+        confidence: Option<&str>,
+        raw_text: Option<&str>,
+        description: Option<&str>,
+        model: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO ocr_license_plate_samples (
+                id, image_filename, plate_number, vehicle_type, confidence,
+                raw_text, description, model, provider, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                id,
+                image_filename,
+                plate_number,
+                vehicle_type,
+                confidence,
+                raw_text,
+                description,
+                model,
+                provider,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List recent OCR license plate samples.
+    pub async fn list_ocr_samples(&self, limit: usize) -> Result<Vec<OcrSampleRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, image_filename, plate_number, vehicle_type, confidence,
+                   raw_text, description, model, provider, created_at
+            FROM ocr_license_plate_samples
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let created_at_str: String = row.get(9)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(OcrSampleRow {
+                id: row.get(0)?,
+                image_filename: row.get(1)?,
+                plate_number: row.get(2)?,
+                vehicle_type: row.get(3)?,
+                confidence: row.get(4)?,
+                raw_text: row.get(5)?,
+                description: row.get(6)?,
+                model: row.get(7)?,
+                provider: row.get(8)?,
+                created_at,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -960,5 +1065,30 @@ mod tests {
             .unwrap();
         assert_eq!(stored.api_key.as_deref(), Some(secret));
         assert!(db.list_providers().await.unwrap()[0].api_key_configured);
+    }
+
+    #[tokio::test]
+    async fn ocr_sample_harvesting() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.insert_ocr_sample(
+            "sample-1",
+            "sample-1.jpg",
+            "B 1234 ABC",
+            Some("car"),
+            Some("high"),
+            Some("B 1234 ABC 05.28"),
+            Some("Black SUV"),
+            "gemma-vision",
+            "nvidia",
+        )
+        .await
+        .unwrap();
+
+        let samples = db.list_ocr_samples(10).await.unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].id, "sample-1");
+        assert_eq!(samples[0].plate_number, "B 1234 ABC");
+        assert_eq!(samples[0].vehicle_type.as_deref(), Some("car"));
+        assert_eq!(samples[0].confidence.as_deref(), Some("high"));
     }
 }

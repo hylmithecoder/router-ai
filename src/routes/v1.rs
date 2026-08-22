@@ -13,6 +13,7 @@ use crate::{
     handlers::{
         chat::{chat_completion, list_models},
         ocr::license_plate_ocr,
+        vision::image_description,
     },
     middleware::require_api_key,
     state::AppState,
@@ -24,5 +25,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/chat/completions", post(chat_completion))
         .route("/models", get(list_models))
         .route("/ocr/licenseplate", post(license_plate_ocr))
+        .route("/ocr/description", post(image_description))
+        .route("/vision/description", post(image_description))
         .layer(from_fn_with_state(state, require_api_key))
 }

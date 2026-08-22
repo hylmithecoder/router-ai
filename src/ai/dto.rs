@@ -222,6 +222,56 @@ pub struct LicensePlateOcrResponse {
     pub usage: Usage,
 }
 
+/// Request for general vision description and OCR text analysis.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageDescriptionRequest {
+    /// Base64-encoded image string, data URI (`data:image/...`), or public HTTP/HTTPS image URL.
+    pub image: String,
+    /// Optional instruction to steer what aspects to describe or analyze.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// Optional target model. Defaults to "auto" with failover rotation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Explicit provider selector ("nvidia", "auto", etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional timeout in seconds before switching to the next vision model (default: 15s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Structured outcome of general visual description & text extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageDescriptionData {
+    /// Comprehensive description of the image content and visual elements.
+    pub description: String,
+    /// Any text, OCR, typography, or captions visible in the image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extracted_text: Option<String>,
+    /// Semantic keywords / tags describing the image.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Whether the image contains sensitive/inappropriate content (NSFW, gore, hate symbols).
+    pub is_sensitive: bool,
+    /// Reason explaining why the image was flagged as sensitive, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_reason: Option<String>,
+    /// Upstream vision model that produced this description.
+    pub model: String,
+    /// Upstream provider name.
+    pub provider: String,
+}
+
+/// Standard envelope for vision description responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageDescriptionResponse {
+    pub success: bool,
+    pub data: ImageDescriptionData,
+    #[serde(default)]
+    pub usage: Usage,
+}
+
 /// Non-streaming response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCompletionResponse {
