@@ -46,6 +46,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Key hashing.
+regex = "1.11"
 sha2 = "0.10"
 
 # AEAD encryption for persisted upstream API keys.

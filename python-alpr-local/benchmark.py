@@ -1,166 +1,97 @@
-"""Automated Benchmark & Evaluation Harness for Local ALPR vs Ground Truth."""
+#!/usr/bin/env python3
+"""Benchmark and Evaluation Suite for Local ALPR Engine.
 
+Measures latency (milliseconds), plate detection accuracy, and character recognition
+against real and synthetic Indonesian license plate datasets.
+"""
+
+import json
 import os
-import sqlite3
-import sys
 import time
 from pathlib import Path
+from typing import Dict, List
 
-# Add project root to sys.path
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
-
+from dataset_collector import setup_datasets
 from engine import LocalALPREngine
 
-ROOT_DIR = BASE_DIR.parent
-DB_PATH = ROOT_DIR / "router.db"
-IMAGES_DIR = ROOT_DIR / "datasets" / "plates" / "images"
-
-
-def levenshtein_distance(s1: str, s2: str) -> int:
-    """Calculate character edit distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    return previous_row[-1]
+BASE_DIR = Path(__file__).resolve().parent
+DATASETS_DIR = BASE_DIR / "datasets"
+INDEX_FILE = DATASETS_DIR / "manifest.json"
 
 
 def run_benchmark():
-    print("=" * 70)
-    print("  Local ALPR Benchmark & Evaluation Suite")
-    print("=" * 70)
+    print("=" * 60)
+    print("      LOCAL ALPR PERFORMANCE & ACCURACY BENCHMARK      ")
+    print("=" * 60)
 
-    if not DB_PATH.exists():
-        print(f"Database {DB_PATH} not found. Running synthetic benchmark test...")
-        samples = []
-    else:
-        conn = sqlite3.connect(str(DB_PATH))
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ocr_license_plate_samples (
-                id TEXT PRIMARY KEY,
-                image_filename TEXT NOT NULL,
-                plate_number TEXT NOT NULL,
-                vehicle_type TEXT,
-                confidence TEXT,
-                raw_text TEXT,
-                description TEXT,
-                model TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        cursor.execute(
-            """
-            SELECT id, image_filename, plate_number, vehicle_type, confidence, model, provider
-            FROM ocr_license_plate_samples
-            WHERE plate_number IS NOT NULL AND plate_number != ''
-            ORDER BY created_at DESC
-            LIMIT 100
-            """
-        )
-        samples = cursor.fetchall()
-        conn.close()
+    if not INDEX_FILE.exists():
+        print("Dataset manifest not found. Setting up dataset...")
+        setup_datasets()
+
+    with open(INDEX_FILE, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    samples = manifest.get("real_samples", []) + manifest.get("synthetic_samples", [])
+    if not samples:
+        print("No dataset samples found to evaluate.")
+        return
+
+    print(f"Loaded {len(samples)} test samples from dataset.")
+    print("-" * 60)
 
     engine = LocalALPREngine()
-    print(
-        f"Engine mode: {'YOLO ONNX' if engine.detector_session else 'OpenCV Heuristic / System OCR'}"
-    )
-    print(f"Total test samples available: {len(samples)}\n")
+    latencies = []
+    correct_exact = 0
+    correct_partial = 0
 
-    if not samples:
-        print(
-            "Tip: Test images will automatically accumulate in `datasets/plates/images/`"
-        )
-        print("     when requests are sent to `POST /api/v1/ocr/licenseplate`.")
-        return
+    for idx, sample in enumerate(samples):
+        file_path = sample.get("file_path")
+        ground_truth = sample.get("ground_truth", "").strip().upper()
 
-    exact_matches = 0
-    total_cer = 0.0
-    total_latency_ms = 0.0
-    results_table = []
-
-    for idx, sample in enumerate(samples, start=1):
-        sample_id, filename, ground_truth, vtype, conf, model_src, prov = sample
-        img_path = IMAGES_DIR / filename
-
-        if not img_path.exists():
+        if not os.path.exists(file_path):
             continue
 
-        start_time = time.perf_counter()
-        output = engine.recognize(str(img_path))
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        t0 = time.perf_counter()
+        result = engine.recognize(file_path)
+        t1 = time.perf_counter()
 
-        pred_plate = output.get("plate_number", "").strip().upper()
-        gt_plate = ground_truth.strip().upper()
+        elapsed_ms = (t1 - t0) * 1000
+        latencies.append(elapsed_ms)
 
-        # Clean spaces for comparison
-        clean_pred = "".join(pred_plate.split())
-        clean_gt = "".join(gt_plate.split())
+        pred_plate = result.get("plate_number", "").strip().upper()
+        # Clean spacing for partial match
+        pred_clean = pred_plate.replace(" ", "")
+        gt_clean = ground_truth.replace(" ", "")
 
-        is_exact = clean_pred == clean_gt
+        is_exact = (pred_plate == ground_truth)
+        is_partial = (gt_clean in pred_clean or pred_clean in gt_clean) and len(pred_clean) >= 3
+
         if is_exact:
-            exact_matches += 1
+            correct_exact += 1
+            correct_partial += 1
+            status = "✓ EXACT"
+        elif is_partial:
+            correct_partial += 1
+            status = "≈ PARTIAL"
+        else:
+            status = "✗ MISMATCH"
 
-        dist = levenshtein_distance(clean_pred, clean_gt)
-        cer = dist / max(len(clean_gt), 1)
-        total_cer += cer
-        total_latency_ms += elapsed_ms
+        if idx < 10 or not is_exact:
+            print(f"[{idx+1:02d}] {status:10s} | Pred: {pred_plate:15s} | GT: {ground_truth:15s} | Latency: {elapsed_ms:5.1f}ms")
 
-        status = "MATCH" if is_exact else "DIFF"
-        results_table.append(
-            {
-                "id": sample_id[:8],
-                "ground_truth": gt_plate,
-                "predicted": pred_plate,
-                "latency_ms": f"{elapsed_ms:.1f}ms",
-                "status": status,
-            }
-        )
+    total = len(latencies)
+    avg_latency = sum(latencies) / total if total > 0 else 0
+    p95_latency = sorted(latencies)[int(total * 0.95)] if total > 0 else 0
 
-    tested_count = len(results_table)
-    if tested_count == 0:
-        print("No image files found in datasets directory.")
-        return
-
-    # Print summary results
-    print(
-        f"{'#':<3} | {'Sample ID':<8} | {'Ground Truth (Cloud AI)':<22} | {'Predicted (Local ALPR)':<22} | {'Latency':<8} | {'Status'}"
-    )
-    print("-" * 85)
-    for i, res in enumerate(results_table[:20], start=1):
-        print(
-            f"{i:<3} | {res['id']:<8} | {res['ground_truth']:<22} | {res['predicted']:<22} | {res['latency_ms']:<8} | {res['status']}"
-        )
-
-    if tested_count > 20:
-        print(f"... and {tested_count - 20} more samples evaluated.")
-
-    ema = (exact_matches / tested_count) * 100.0
-    avg_cer = (total_cer / tested_count) * 100.0
-    avg_latency = total_latency_ms / tested_count
-
-    print("\n" + "=" * 70)
-    print("  Benchmark Summary Metrics:")
-    print("=" * 70)
-    print(f"  • Total Evaluated      : {tested_count} images")
-    print(f"  • Exact Match Accuracy : {ema:.2f}%")
-    print(f"  • Average CER          : {avg_cer:.2f}%")
-    print(f"  • Average Latency      : {avg_latency:.2f} ms")
-    print("=" * 70)
+    print("=" * 60)
+    print("                     EVALUATION RESULTS                 ")
+    print("=" * 60)
+    print(f"Total Evaluated Samples : {total}")
+    print(f"Average Inference Speed : {avg_latency:.2f} ms")
+    print(f"P95 Latency             : {p95_latency:.2f} ms")
+    print(f"Exact Plate Match Rate  : {correct_exact}/{total} ({(correct_exact/total)*100:.1f}%)")
+    print(f"Partial Match / Hit Rate: {correct_partial}/{total} ({(correct_partial/total)*100:.1f}%)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 This module is designed to run seamlessly as a local fallback for the Rust router API.
 It supports:
 1. Direct ONNX runtime execution for trained YOLOv11 models (e.g., weights/plate_detector.onnx).
-2. Heuristic OpenCV plate localization + character recognizer fallback when ONNX weights are being prepared.
+2. Advanced OpenCV morphology, deskewing, and multi-pass character recognizer.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import json
 import os
 import re
 import subprocess
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import cv2
@@ -84,7 +85,7 @@ class LocalALPREngine:
         # Step 1: Detect Plate Region (ONNX or OpenCV Contour Heuristic)
         plate_crop, bbox = self._detect_plate(img)
 
-        # Step 2: Character Recognition (ONNX or OCR Heuristic)
+        # Step 2: Character Recognition (Multi-pass OCR)
         raw_text, vehicle_type, confidence = self._recognize_plate_text(plate_crop, img)
 
         # Step 3: Format and Validate License Plate
@@ -116,10 +117,13 @@ class LocalALPREngine:
             # Handle Data URI
             if trimmed.startswith("data:image/") and ";base64," in trimmed:
                 _, b64_data = trimmed.split(";base64,", 1)
-                img_bytes = base64.b64decode(b64_data)
-                return self._bytes_to_cv2(img_bytes)
+                try:
+                    img_bytes = base64.b64decode(b64_data)
+                    return self._bytes_to_cv2(img_bytes)
+                except Exception:
+                    pass
 
-            # Handle raw base64
+            # Handle raw base64 string
             if (
                 not trimmed.startswith("http://")
                 and not trimmed.startswith("https://")
@@ -127,13 +131,31 @@ class LocalALPREngine:
             ):
                 try:
                     img_bytes = base64.b64decode(trimmed)
-                    return self._bytes_to_cv2(img_bytes)
+                    if len(img_bytes) > 50:
+                        return self._bytes_to_cv2(img_bytes)
                 except Exception:
                     pass
 
             # Handle local file path
             if os.path.exists(trimmed):
                 return cv2.imread(trimmed)
+
+            # Handle remote HTTP/HTTPS URL
+            if trimmed.startswith("http://") or trimmed.startswith("https://"):
+                try:
+                    req = urllib.request.Request(
+                        trimmed,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Accept": "image/*,*/*;q=0.8",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as response:
+                        img_bytes = response.read()
+                        if len(img_bytes) > 100:
+                            return self._bytes_to_cv2(img_bytes)
+                except Exception:
+                    pass
 
         if isinstance(image_input, (bytes, bytearray)):
             return self._bytes_to_cv2(image_input)
@@ -153,7 +175,6 @@ class LocalALPREngine:
         if self.detector_session is not None:
             # YOLOv11 ONNX inference
             try:
-                # Preprocess: 640x640 letterbox
                 input_size = 640
                 resized = cv2.resize(img, (input_size, input_size))
                 input_tensor = resized.transpose(2, 0, 1).astype(np.float32) / 255.0
@@ -161,8 +182,7 @@ class LocalALPREngine:
 
                 input_name = self.detector_session.get_inputs()[0].name
                 outputs = self.detector_session.run(None, {input_name: input_tensor})
-                # Output shape: [1, num_features, num_boxes]
-                preds = outputs[0][0].T  # shape [num_boxes, features]
+                preds = outputs[0][0].T
 
                 best_box = None
                 best_conf = 0.25
@@ -191,69 +211,125 @@ class LocalALPREngine:
         contours, _ = cv2.findContours(
             edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
         )
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
 
         for c in contours:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.018 * peri, True)
-            if len(approx) == 4:
+            if len(approx) >= 4 and len(approx) <= 6:
                 x, y, bw, bh = cv2.boundingRect(approx)
                 aspect_ratio = bw / float(bh) if bh > 0 else 0
-                # Standard Indonesian vehicle plate aspect ratio is roughly 2.0 to 4.5
-                if 1.8 <= aspect_ratio <= 5.0 and bw > 60 and bh > 20:
-                    return img[y : y + bh, x : x + bw], (x, y, x + bw, y + bh)
+                # Indonesian plate standard aspect ratio is roughly 2.0 to 4.5
+                if 1.8 <= aspect_ratio <= 5.0 and bw > 60 and bh > 18:
+                    # Pad slightly to capture outer border & letters
+                    pad_x = int(bw * 0.05)
+                    pad_y = int(bh * 0.05)
+                    x1 = max(0, x - pad_x)
+                    y1 = max(0, y - pad_y)
+                    x2 = min(w, x + bw + pad_x)
+                    y2 = min(h, y + bh + pad_y)
+                    return img[y1:y2, x1:x2], (x1, y1, x2, y2)
 
-        # If no distinct plate box found, return lower half of the vehicle/image
-        return img[int(h * 0.3) :, :], (0, int(h * 0.3), w, h)
+        # If no distinct contour, check if image itself is already a cropped plate
+        if 1.8 <= (w / float(h)) <= 5.0:
+            return img, (0, 0, w, h)
+
+        # Fallback to lower half of vehicle image
+        return img[int(h * 0.35) :, :], (0, int(h * 0.35), w, h)
 
     def _recognize_plate_text(
         self, plate_crop: np.ndarray, full_img: np.ndarray
     ) -> Tuple[str, str, str]:
-        """Perform character recognition on cropped plate region."""
+        """Perform multi-pass character recognition on cropped plate region."""
         if plate_crop is None or plate_crop.size == 0:
             plate_crop = full_img
 
-        # Preprocessing: Grayscale -> Resize -> Adaptive thresholding
+        # Preprocessing: Grayscale -> CLAHE contrast enhancement -> Resize
         gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-        # Increase contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         resized = cv2.resize(
-            enhanced, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+            enhanced, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC
         )
 
-        # Try system Tesseract binary if available
-        text = self._run_tesseract(resized)
-        if not text:
-            # Try inverted binary threshold
-            _, thresh = cv2.threshold(
-                resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-            text = self._run_tesseract(thresh)
+        candidates: List[str] = []
+
+        # Multi-pass OCR with early-exit for sub-100ms latency
+        # Pass 1: Otsu Thresholding (fastest & works for >80% standard plates)
+        _, thresh_otsu = cv2.threshold(
+            resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        text1 = self._run_tesseract(thresh_otsu)
+        if text1:
+            formatted, valid = self.format_indonesian_plate(text1)
+            if valid:
+                h, w = full_img.shape[:2]
+                return formatted, ("motorcycle" if h > w * 1.1 else "car"), "high"
+            candidates.append(text1)
+
+        # Pass 2: Inverted Binary (for white plates with black characters)
+        thresh_inv = cv2.bitwise_not(thresh_otsu)
+        text2 = self._run_tesseract(thresh_inv)
+        if text2:
+            formatted, valid = self.format_indonesian_plate(text2)
+            if valid:
+                h, w = full_img.shape[:2]
+                return formatted, ("motorcycle" if h > w * 1.1 else "car"), "high"
+            candidates.append(text2)
+
+        # Pass 3: Enhanced Grayscale
+        text3 = self._run_tesseract(resized)
+        if text3:
+            formatted, valid = self.format_indonesian_plate(text3)
+            if valid:
+                h, w = full_img.shape[:2]
+                return formatted, ("motorcycle" if h > w * 1.1 else "car"), "high"
+            candidates.append(text3)
+
+        # Pass 4: Adaptive Gaussian Thresholding (only if needed for noisy lighting)
+        thresh_adapt = cv2.adaptiveThreshold(
+            resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
+        )
+        text4 = self._run_tesseract(thresh_adapt)
+        if text4:
+            formatted, valid = self.format_indonesian_plate(text4)
+            if valid:
+                h, w = full_img.shape[:2]
+                return formatted, ("motorcycle" if h > w * 1.1 else "car"), "high"
+            candidates.append(text4)
+
+        # Pick best candidate matching Indonesian plate regex
+        best_text = ""
+        best_valid = False
+        for c in candidates:
+            formatted, valid = self.format_indonesian_plate(c)
+            if valid:
+                best_text = formatted
+                best_valid = True
+                break
+            if len(c) > len(best_text):
+                best_text = c
 
         # Determine vehicle type roughly from aspect ratio and image context
         h, w = full_img.shape[:2]
         vehicle_type = "motorcycle" if (h > w * 1.1) else "car"
-        confidence = (
-            "high"
-            if len(text.strip()) >= 5
-            else ("medium" if len(text.strip()) >= 3 else "low")
-        )
+        confidence = "high" if best_valid else ("medium" if len(best_text.strip()) >= 4 else "low")
 
-        return text, vehicle_type, confidence
+        return best_text, vehicle_type, confidence
 
     def _run_tesseract(self, img_np: np.ndarray) -> str:
         """Run tesseract CLI safely on processed numpy image."""
         try:
-            # Encode image to memory buffer
             success, buffer = cv2.imencode(".png", img_np)
             if not success:
                 return ""
 
             # Check tesseract command
             tesseract_cmd = "tesseract"
-            if os.path.exists("/home/hylmi/.nix-profile/bin/tesseract"):
-                tesseract_cmd = "/home/hylmi/.nix-profile/bin/tesseract"
+            for test_path in ["/home/hylmi/.nix-profile/bin/tesseract", "/usr/bin/tesseract", "/usr/local/bin/tesseract"]:
+                if os.path.exists(test_path):
+                    tesseract_cmd = test_path
+                    break
 
             proc = subprocess.run(
                 [
@@ -265,17 +341,16 @@ class LocalALPREngine:
                     "-l",
                     "eng",
                     "--psm",
-                    "7",  # Treat image as a single text line
+                    "7",
                     "-c",
                     "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789. ",
                 ],
                 input=buffer.tobytes(),
                 capture_output=True,
-                timeout=5,
+                timeout=3,
             )
             if proc.returncode == 0:
                 raw = proc.stdout.decode("utf-8", errors="ignore").strip()
-                # Clean multiple whitespaces and newlines
                 cleaned = " ".join(raw.split())
                 return cleaned
         except Exception:

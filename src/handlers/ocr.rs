@@ -49,7 +49,7 @@ pub async fn license_plate_ocr(
     );
 
     if is_fast_local {
-        match try_local_alpr_fallback(&state, image_input, &auth.id, started).await {
+        match try_local_alpr_fallback(&state, image_input, &auth.id, started, true).await {
             Ok(resp) => return Ok(Json(resp)),
             Err(err) => {
                 tracing::warn!("explicit fast local alpr execution failed: {err}, continuing to cloud vision");
@@ -158,7 +158,7 @@ pub async fn license_plate_ocr(
             // Attempt seamless fallback to Local ALPR Engine when upstream providers are down
             if status == 503
                 && let Ok(fallback_resp) =
-                    try_local_alpr_fallback(&state, image_input, &auth.id, started).await
+                    try_local_alpr_fallback(&state, image_input, &auth.id, started, false).await
             {
                 return Ok(Json(fallback_resp));
             }
@@ -272,6 +272,7 @@ async fn try_local_alpr_fallback(
     image_input: &str,
     auth_id: &str,
     started: std::time::Instant,
+    allow_empty: bool,
 ) -> Result<LicensePlateOcrResponse, String> {
     let script_path = "python-alpr-local/main.py";
     if !std::path::Path::new(script_path).exists() {
@@ -308,7 +309,7 @@ async fn try_local_alpr_fallback(
     let clean = clean_json_codeblock(&stdout);
 
     let data = parse_license_plate_output(&clean, "local-alpr-v1", "local");
-    if data.plate_number.is_empty() {
+    if !allow_empty && data.plate_number.is_empty() {
         return Err("local alpr did not detect plate".to_string());
     }
 
@@ -403,25 +404,23 @@ fn parse_license_plate_output(raw_content: &str, model: &str, provider: &str) ->
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        if !plate_number.is_empty() {
-            return LicensePlateData {
-                plate_number,
-                vehicle_type,
-                confidence,
-                raw_text,
-                description,
-                model: model.to_string(),
-                provider: provider.to_string(),
-            };
-        }
+        return LicensePlateData {
+            plate_number,
+            vehicle_type,
+            confidence,
+            raw_text,
+            description,
+            model: model.to_string(),
+            provider: provider.to_string(),
+        };
     }
 
-    // Fallback: extract plate-like pattern or first line if JSON parsing failed
+    // Fallback: extract plate-like pattern or first clean line if JSON parsing failed
     let fallback_plate = extract_plate_fallback(raw_content);
     LicensePlateData {
         plate_number: fallback_plate,
         vehicle_type: None,
-        confidence: Some("medium".to_string()),
+        confidence: Some("low".to_string()),
         raw_text: Some(raw_content.trim().to_string()),
         description: None,
         model: model.to_string(),
@@ -447,13 +446,29 @@ fn clean_json_codeblock(s: &str) -> String {
 }
 
 fn extract_plate_fallback(text: &str) -> String {
+    let plate_regex = regex::Regex::new(r"(?i)\b([A-Z]{1,2})\s*([0-9]{1,4})\s*([A-Z]{1,3})\b").ok();
+    if let Some(re) = plate_regex {
+        if let Some(caps) = re.captures(text) {
+            if let (Some(c1), Some(c2), Some(c3)) = (caps.get(1), caps.get(2), caps.get(3)) {
+                return format!("{} {} {}", c1.as_str().to_uppercase(), c2.as_str(), c3.as_str().to_uppercase());
+            }
+        }
+    }
+
     for line in text.lines() {
         let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('{') && !trimmed.starts_with('`') {
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('{')
+            && !trimmed.starts_with('}')
+            && !trimmed.starts_with('`')
+            && !trimmed.starts_with('"')
+            && !trimmed.contains("plate_number")
+            && !trimmed.contains(':')
+        {
             return trimmed.to_string();
         }
     }
-    text.trim().chars().take(20).collect()
+    String::new()
 }
 
 #[cfg(test)]
