@@ -34,8 +34,7 @@ else
 MUSL_CC ?= $(CURDIR)/scripts/zig-cc
 endif
 
-export CC_$(shell echo $(TARGET) | tr '-' '_')  := $(MUSL_CC)
-export CARGO_TARGET_$(shell echo $(TARGET) | tr '-' '_')_LINKER := $(MUSL_CC)
+export CC_$(shell echo $(TARGET) | tr '-' '_') := $(MUSL_CC)
 
 .PHONY: help setup webui build run run-prod clean
 
@@ -57,9 +56,9 @@ build: webui
 	rustup target add $(TARGET)
 	$(CARGO) build --release --target $(TARGET)
 	mkdir -p dist
-	cp target/$(TARGET)/release/$(BINARY) $(OUT)
+	install -m 755 target/$(TARGET)/release/$(BINARY) $(OUT)
 	@file $(OUT)
-	@echo "→ single binary: $(OUT)  (serves API + dashboard on one port)"
+	@echo "→ single static binary: $(OUT)  (serves API + dashboard on one port)"
 
 ## Dev mode: run both stacks side by side.
 run:
