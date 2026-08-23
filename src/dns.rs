@@ -173,7 +173,7 @@ pub async fn resolve_domain(domain: &str) -> anyhow::Result<Vec<Ipv4Addr>> {
 pub async fn build_dns_hardened_client(extra_domains: &[&str]) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120));
+        .timeout(Duration::from_secs(300));
 
     let mut all_domains = DEFAULT_UPSTREAM_DOMAINS.to_vec();
     for d in extra_domains {

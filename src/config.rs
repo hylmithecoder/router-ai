@@ -190,7 +190,7 @@ impl Settings {
         let cli_timeout_secs = env::var("ROUTER_CLI_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(120);
+            .unwrap_or(300);
 
         let agent_workdir = env::var("ROUTER_AGENT_WORKDIR").unwrap_or_else(|_| ".".to_string());
 

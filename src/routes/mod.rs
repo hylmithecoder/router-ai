@@ -53,7 +53,7 @@ pub fn create_router(state: AppState) -> Router {
                 // because both may require the inner response body to implement `Default`.
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
-                    Duration::from_secs(120),
+                    Duration::from_secs(300),
                 )),
         )
         // Applied as a separate layer because `from_fn` middleware cannot always be combined

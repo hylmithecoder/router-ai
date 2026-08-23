@@ -26,7 +26,7 @@ impl AppState {
     pub fn new(config: Settings, db: Db, router: AiRouter) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("failed to build http client");
 

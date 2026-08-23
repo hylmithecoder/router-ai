@@ -25,7 +25,7 @@ pub const VISION_CANDIDATE_MODELS: &[&str] = &[
     "minimaxai/minimax-m3",
 ];
 
-pub const DEFAULT_VISION_TIMEOUT_SECS: u64 = 15;
+pub const DEFAULT_VISION_TIMEOUT_SECS: u64 = 60;
 
 /// `POST /api/v1/ocr/description` & `POST /api/v1/vision/description`
 ///
