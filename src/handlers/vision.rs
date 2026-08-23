@@ -162,6 +162,44 @@ pub async fn image_description(
         }
     }
 
+    // Attempt local OCR/vision fallback before returning 503
+    if let Ok(local_text) = run_local_vision_fallback(image_input).await
+        && !local_text.trim().is_empty()
+    {
+        let data = ImageDescriptionData {
+            description: format!("Locally analyzed image OCR fallback: {local_text}"),
+            extracted_text: Some(local_text),
+            tags: vec!["local-ocr".to_string(), "fallback".to_string()],
+            is_sensitive: false,
+            safety_reason: None,
+            model: "local-vision-v1".to_string(),
+            provider: "local".to_string(),
+        };
+        let latency = started.elapsed().as_millis() as i64;
+        let _ = state
+            .db
+            .insert_usage(
+                &auth.id,
+                "local-vision-v1",
+                "local",
+                0,
+                0,
+                latency,
+                StatusCode::OK.as_u16() as i64,
+            )
+            .await;
+
+        return Ok(Json(ImageDescriptionResponse {
+            success: true,
+            data,
+            usage: crate::ai::dto::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+        }));
+    }
+
     // All candidate models failed or timed out
     let latency = started.elapsed().as_millis() as i64;
     let _ = state
@@ -180,6 +218,54 @@ pub async fn image_description(
     Err(AppError::UpstreamUnavailable(format!(
         "all vision models failed or timed out: {last_error_msg}"
     )))
+}
+
+async fn run_local_vision_fallback(image_input: &str) -> Result<String, String> {
+    let script_path = std::path::Path::new("python-alpr-local/main.py");
+    if !script_path.exists() {
+        return Err("local alpr script not found".to_string());
+    }
+
+    let mut child = tokio::process::Command::new("python3")
+        .arg(script_path)
+        .arg("infer")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn local alpr process: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(image_input.as_bytes()).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "local vision fallback timed out".to_string())?
+    .map_err(|e| format!("local vision process failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err("local vision process exited with non-zero status".to_string());
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+        let text = val.get("raw_text")
+            .or_else(|| val.get("plate_number"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !text.is_empty() {
+            return Ok(text);
+        }
+    }
+    Ok(raw)
 }
 
 fn normalize_image_url(image_input: &str) -> String {

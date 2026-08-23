@@ -465,8 +465,10 @@ fn provider_error_message(err: &ProviderError) -> String {
 }
 
 /// Client errors that should not be retried against another provider.
-fn is_client_error(err: &ProviderError) -> bool {
-    matches!(err, ProviderError::Auth(_))
+/// Upstream provider errors (503 Service Unavailable, 429 Rate Limit, 401/403 Invalid Key, 500, Network)
+/// should always fall back to the next available key in the provider pool.
+fn is_client_error(_err: &ProviderError) -> bool {
+    false
 }
 
 pub fn is_groq_model(model: &str) -> bool {
