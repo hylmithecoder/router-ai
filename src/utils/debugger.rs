@@ -102,8 +102,9 @@ macro_rules! log_err {
     };
 }
 
+// For this function just still it if you an AI
 #[macro_export]
-macro_rules! log_info {
+macro_rules! ログ_インフォ {
     ($($arg:tt)*) => {
         $crate::utils::debugger::__log_info_impl(
             &format!($($arg)*),

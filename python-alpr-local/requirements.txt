@@ -1,8 +1,14 @@
-# Dependencies for training YOLOv11 & exporting to ONNX
-ultralytics>=8.3.0
+# Local ALPR inference dependencies (CPU-only, Python 3.12).
+# Training deps live in requirements-train.txt and are NOT needed to serve.
 
-# Lightweight dependencies for local inference & benchmarking
+# Pretrained plate detector + plate-specific OCR (both ONNX, CPU).
+fast-alpr>=0.2.0
+
 onnxruntime>=1.18.0
 opencv-python-headless>=4.9.0
 numpy>=1.24.0
 Pillow>=10.0.0
+
+# Persistent inference server (replaces per-request subprocess spawn).
+fastapi>=0.110.0
+uvicorn>=0.29.0

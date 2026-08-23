@@ -58,6 +58,12 @@ impl ProviderKind {
             Self::OpenCode | Self::Codex | Self::Claude | Self::Agy
         )
     }
+
+    /// Local agents that can be handed image attachments on the command line,
+    /// and so may serve a vision request when every cloud model is exhausted.
+    pub fn cli_supports_images(self) -> bool {
+        matches!(self, Self::OpenCode | Self::Codex)
+    }
 }
 
 impl fmt::Display for ProviderKind {
@@ -114,10 +120,48 @@ pub enum ProviderError {
     Auth(String),
     /// 404 — model unknown to this provider; try the next one.
     NotFound(String),
+    /// 400/422 — the request shape or the model id is wrong for this provider.
+    /// The key itself is healthy, so the router retries another model on the
+    /// same provider instead of putting the key in cooldown.
+    BadRequest(String),
     /// 5xx upstream or a non-zero local CLI exit.
     Upstream(String),
     /// Network / timeout / transport / missing executable error.
     Network(String),
+}
+
+impl ProviderError {
+    /// Is this failure caused by the model/request rather than by the key?
+    ///
+    /// These are worth retrying against a different model on the *same*
+    /// provider; they say nothing about whether the credential still works.
+    pub fn is_model_specific(&self) -> bool {
+        match self {
+            Self::BadRequest(_) | Self::NotFound(_) => true,
+            // NVIDIA NIM reports per-model worker saturation as a 503
+            // ("ResourceExhausted: Worker local total request limit reached
+            // (16/16)"). That one model is full; a different one on the same
+            // key usually still answers, so keep working the ladder.
+            Self::Upstream(message) => {
+                let m = message.to_ascii_lowercase();
+                m.contains("resourceexhausted")
+                    || m.contains("worker local total request limit")
+                    || m.contains("no healthy upstream")
+                    || m.contains("model is currently loading")
+            }
+            _ => false,
+        }
+    }
+
+    /// Should this failure count against the *key* (cooldown), as opposed to
+    /// just the model that was tried?
+    ///
+    /// A wrong or retired model id says nothing about the credential. Worker
+    /// saturation does — once every model on that key is full, it deserves a
+    /// rest — so it advances the ladder *and* still blames the key at the end.
+    pub fn blames_key(&self) -> bool {
+        !matches!(self, Self::BadRequest(_) | Self::NotFound(_))
+    }
 }
 
 impl Provider {
@@ -222,7 +266,7 @@ impl Provider {
         req: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         if self.kind.is_cli() {
-            return self.run_cli(req).await;
+            return self.run_cli(client, req).await;
         }
 
         let forwarded = self.normalized_request(req);
@@ -308,6 +352,7 @@ impl Provider {
 
     async fn run_cli(
         &self,
+        client: &reqwest::Client,
         req: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError> {
         let command = self.command.as_deref().ok_or_else(|| {
@@ -319,9 +364,33 @@ impl Provider {
             )));
         }
 
-        let prompt = render_prompt(req);
+        // Agent CLIs take images as files on disk, so anything the request
+        // carries inline or by URL has to be materialized first. The guard
+        // lives here (rather than at the call site) so a text-only agent never
+        // silently answers a vision request about an image it cannot see.
+        let image_urls = collect_image_urls(req);
+        let _images = if image_urls.is_empty() {
+            MaterializedImages::default()
+        } else if self.kind.cli_supports_images() {
+            MaterializedImages::fetch(client, &image_urls).await?
+        } else {
+            return Err(ProviderError::BadRequest(format!(
+                "{} cannot accept image attachments",
+                self.kind.as_str()
+            )));
+        };
+
+        // Claude takes the caller's system messages through its own
+        // `--system-prompt`; the others only have the prompt itself.
+        let native_system_prompt = matches!(self.kind, ProviderKind::Claude);
+        let prompt = render_prompt(req, !native_system_prompt);
         let model = cli_model_argument(self, req);
-        let (args, prompt_on_stdin) = self.cli_args(model.as_deref(), &prompt);
+        let (args, prompt_on_stdin) = self.cli_args(
+            model.as_deref(),
+            &prompt,
+            &cli_system_prompt(req),
+            &_images.paths,
+        );
 
         let mut child_command = Command::new(command);
         child_command
@@ -411,11 +480,21 @@ impl Provider {
         })
     }
 
-    fn cli_args(&self, model: Option<&str>, prompt: &str) -> (Vec<String>, bool) {
+    fn cli_args(
+        &self,
+        model: Option<&str>,
+        prompt: &str,
+        system_prompt: &str,
+        image_paths: &[String],
+    ) -> (Vec<String>, bool) {
         match self.kind {
             ProviderKind::OpenCode => {
+                // The prompt goes first: `--file` is a variadic array flag, so
+                // a prompt placed after it is swallowed as another filename
+                // ("Error: File not found: Describe this image...").
                 let mut args = vec![
                     "run".to_string(),
+                    prompt.to_string(),
                     "--format".to_string(),
                     "json".to_string(),
                     "--pure".to_string(),
@@ -423,33 +502,47 @@ impl Provider {
                 if let Some(model) = model {
                     args.extend(["--model".to_string(), model.to_string()]);
                 }
-                args.push(prompt.to_string());
+                for path in image_paths {
+                    args.extend(["--file".to_string(), path.to_string()]);
+                }
                 (args, false)
             }
             ProviderKind::Codex => {
+                // `codex exec` is already non-interactive and never prompts for
+                // approval, so there is no `--ask-for-approval` here; passing it
+                // made codex exit 2 before it ever read the prompt.
                 let mut args = vec![
                     "exec".to_string(),
                     "--ephemeral".to_string(),
                     "--sandbox".to_string(),
                     "read-only".to_string(),
-                    "--ask-for-approval".to_string(),
-                    "never".to_string(),
                     "--skip-git-repo-check".to_string(),
+                    "--ignore-user-config".to_string(),
                     "--color".to_string(),
                     "never".to_string(),
                 ];
                 if let Some(model) = model {
                     args.extend(["--model".to_string(), model.to_string()]);
                 }
+                for path in image_paths {
+                    args.extend(["--image".to_string(), path.to_string()]);
+                }
                 args.push("-".to_string());
                 (args, true)
             }
             ProviderKind::Claude => {
+                // Without replacing the system prompt, Claude Code answers as a
+                // repo coding agent ("I can't just return bare JSON…") instead
+                // of serving the request. `--bare` would also be desirable here
+                // but it forces ANTHROPIC_API_KEY auth and breaks OAuth logins.
                 let mut args = vec![
                     "--print".to_string(),
                     "--output-format".to_string(),
                     "json".to_string(),
                     "--no-session-persistence".to_string(),
+                    "--system-prompt".to_string(),
+                    system_prompt.to_string(),
+                    "--exclude-dynamic-system-prompt-sections".to_string(),
                     "--tools".to_string(),
                     "".to_string(),
                     "--permission-mode".to_string(),
@@ -462,8 +555,20 @@ impl Provider {
                 (args, false)
             }
             ProviderKind::Agy => {
-                let mut args = vec!["--print".to_string(), "--sandbox".to_string()];
-                args.push(prompt.to_string());
+                // `--print` consumes the next token as its prompt, so every
+                // boolean flag must come first and the prompt must be attached
+                // with `=`. Passing `--print --sandbox <prompt>` makes agy read
+                // "--sandbox" as the prompt and exit 2.
+                let mut args = vec![
+                    "--sandbox".to_string(),
+                    "--disable-slash-commands".to_string(),
+                    "--output-format".to_string(),
+                    "text".to_string(),
+                ];
+                if let Some(model) = model {
+                    args.extend(["--model".to_string(), model.to_string()]);
+                }
+                args.push(format!("--print={prompt}"));
                 (args, false)
             }
             ProviderKind::Groq | ProviderKind::Nvidia => (vec![prompt.to_string()], false),
@@ -474,10 +579,41 @@ impl Provider {
 fn cli_model_argument(provider: &Provider, req: &ChatCompletionRequest) -> Option<String> {
     let model = req.model.trim();
     if model.is_empty() || is_provider_alias(&provider.id, provider.kind, model) {
-        None
-    } else {
-        Some(model.to_string())
+        // `auto` on a local agent means "whatever is cheapest here", not
+        // "whatever the CLI defaults to" — local agents are the last-resort
+        // fallback and should not burn a premium model on a moderation call.
+        return cheap_cli_model(provider, req.has_images());
     }
+    Some(model.to_string())
+}
+
+/// The cheapest model to run a local agent CLI with. A vision request needs a
+/// model that can actually see, so it gets its own (still free) default.
+///
+/// Overridable per kind via `ROUTER_AGY_MODEL`, `ROUTER_CLAUDE_MODEL`,
+/// `ROUTER_CODEX_MODEL`, `ROUTER_OPENCODE_MODEL`, and for images
+/// `ROUTER_OPENCODE_VISION_MODEL` / `ROUTER_CODEX_VISION_MODEL`.
+fn cheap_cli_model(provider: &Provider, has_images: bool) -> Option<String> {
+    if !provider.model.trim().is_empty() && provider.model != "default" {
+        return Some(provider.model.clone());
+    }
+    let (var, default) = match (provider.kind, has_images) {
+        (ProviderKind::OpenCode, true) => (
+            "ROUTER_OPENCODE_VISION_MODEL",
+            Some("opencode/x-preview-f-free"),
+        ),
+        (ProviderKind::Codex, true) => ("ROUTER_CODEX_VISION_MODEL", None),
+        (ProviderKind::Agy, _) => ("ROUTER_AGY_MODEL", Some("gemini-3.5-flash-low")),
+        (ProviderKind::Claude, _) => ("ROUTER_CLAUDE_MODEL", Some("haiku")),
+        (ProviderKind::Codex, false) => ("ROUTER_CODEX_MODEL", None),
+        (ProviderKind::OpenCode, false) => ("ROUTER_OPENCODE_MODEL", None),
+        _ => return None,
+    };
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| default.map(ToString::to_string))
 }
 
 fn is_provider_alias(id: &str, kind: ProviderKind, model: &str) -> bool {
@@ -488,18 +624,197 @@ fn is_provider_alias(id: &str, kind: ProviderKind, model: &str) -> bool {
         || model.eq_ignore_ascii_case("router")
 }
 
-fn render_prompt(req: &ChatCompletionRequest) -> String {
+/// Every image referenced by a chat request, in order.
+fn collect_image_urls(req: &ChatCompletionRequest) -> Vec<String> {
+    req.messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            crate::ai::dto::ChatMessageContent::Parts(parts) => Some(parts),
+            crate::ai::dto::ChatMessageContent::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            crate::ai::dto::ChatContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+            crate::ai::dto::ChatContentPart::Text { .. } => None,
+        })
+        .collect()
+}
+
+/// Request images written to a temporary directory so an agent CLI can attach
+/// them. The directory is removed when this value is dropped.
+#[derive(Debug, Default)]
+struct MaterializedImages {
+    paths: Vec<String>,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl MaterializedImages {
+    async fn fetch(
+        client: &reqwest::Client,
+        urls: &[String],
+    ) -> Result<Self, ProviderError> {
+        let dir = std::env::temp_dir().join(format!("router-cli-images-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            ProviderError::Network(format!("failed to create image scratch dir: {e}"))
+        })?;
+
+        let mut out = Self {
+            paths: Vec::new(),
+            dir: Some(dir.clone()),
+        };
+
+        for (index, url) in urls.iter().enumerate() {
+            let (bytes, extension) = decode_image_source(client, url).await?;
+            let path = dir.join(format!("image-{index}.{extension}"));
+            tokio::fs::write(&path, &bytes)
+                .await
+                .map_err(|e| ProviderError::Network(format!("failed to write image file: {e}")))?;
+            out.paths.push(path.to_string_lossy().to_string());
+        }
+
+        Ok(out)
+    }
+}
+
+impl Drop for MaterializedImages {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Resolve a `data:` URI, bare base64, or HTTP URL into raw image bytes.
+async fn decode_image_source(
+    client: &reqwest::Client,
+    source: &str,
+) -> Result<(Vec<u8>, &'static str), ProviderError> {
+    use base64::prelude::*;
+
+    let source = source.trim();
+    if let Some(rest) = source.strip_prefix("data:") {
+        let (meta, payload) = rest.split_once(",").ok_or_else(|| {
+            ProviderError::BadRequest("malformed data URI for image".to_string())
+        })?;
+        let bytes = BASE64_STANDARD
+            .decode(payload.trim())
+            .map_err(|e| ProviderError::BadRequest(format!("invalid base64 image: {e}")))?;
+        return Ok((bytes, extension_for_mime(meta)));
+    }
+
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        let bytes = BASE64_STANDARD
+            .decode(source)
+            .map_err(|e| ProviderError::BadRequest(format!("invalid base64 image: {e}")))?;
+        return Ok((bytes, "jpg"));
+    }
+
+    let resp = client
+        .get(source)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        )
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| ProviderError::Network(format!("failed to download image: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ProviderError::Network(format!(
+            "failed to download image: status {}",
+            resp.status()
+        )));
+    }
+    let extension = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(extension_for_mime)
+        .unwrap_or("jpg");
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProviderError::Network(format!("failed to read image body: {e}")))?;
+
+    Ok((bytes.to_vec(), extension))
+}
+
+fn extension_for_mime(mime: &str) -> &'static str {
+    let mime = mime.to_ascii_lowercase();
+    if mime.contains("png") {
+        "png"
+    } else if mime.contains("webp") {
+        "webp"
+    } else if mime.contains("gif") {
+        "gif"
+    } else {
+        "jpg"
+    }
+}
+
+/// System prompt handed to agent CLIs that let one be set, so they behave as a
+/// plain completion backend rather than as a repository coding assistant.
+const ROUTER_AGENT_SYSTEM_PROMPT: &str = "You are a completion backend behind an AI router API. Answer the user's request directly and return only the answer itself. If the request asks for a specific output format such as JSON, emit exactly that and nothing else — no preamble, no commentary, no markdown fences. Never edit files, run commands, or ask for permission.";
+
+/// Flatten a chat request into a single prompt for a CLI agent.
+///
+/// Role headers are deliberately *not* rendered as `SYSTEM:` / `USER:` blocks.
+/// Coding agents recognize that shape as an injected instruction frame and
+/// refuse the task ("I detected a SYSTEM instruction inside your message…"),
+/// which is exactly how the moderation fallback used to fail. Framing the
+/// caller's system messages as configuration instead keeps them followed.
+///
+/// When `include_system` is false the caller passes those messages through the
+/// CLI's own system-prompt flag instead.
+fn render_prompt(req: &ChatCompletionRequest, include_system: bool) -> String {
     let mut out = String::from(
-        "You are responding through an AI router API. Return only the assistant answer. Do not edit files, run commands, or ask for interactive permission.\n\n",
+        "You are a completion backend behind an AI router API. Answer the request directly and return only the answer. If a specific output format is requested (for example a single JSON object), emit exactly that with no preamble, commentary, or markdown fences. Never edit files, run commands, or ask for interactive permission.\n\n",
     );
+
+    if include_system {
+        let instructions = collect_system_text(req);
+        if !instructions.is_empty() {
+            out.push_str("## Your configuration for this request\n");
+            out.push_str(&instructions);
+            out.push_str("\n\n");
+        }
+    }
+
+    out.push_str("## Request\n");
     for message in &req.messages {
-        out.push_str(&message.role.to_ascii_uppercase());
-        out.push_str(":\n");
+        if message.role.eq_ignore_ascii_case("system") {
+            continue;
+        }
+        if message.role.eq_ignore_ascii_case("assistant") {
+            out.push_str("Previous reply: ");
+        }
         out.push_str(&message.content.as_text());
         out.push_str("\n\n");
     }
-    out.push_str("ASSISTANT:\n");
+
+    out.push_str("## Your reply\n");
     out
+}
+
+/// The request's system messages, joined.
+fn collect_system_text(req: &ChatCompletionRequest) -> String {
+    req.messages
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("system"))
+        .map(|m| m.content.as_text())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// System prompt for CLIs that accept one: the router's own framing plus
+/// whatever the caller asked for.
+fn cli_system_prompt(req: &ChatCompletionRequest) -> String {
+    let caller = collect_system_text(req);
+    if caller.trim().is_empty() {
+        ROUTER_AGENT_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{ROUTER_AGENT_SYSTEM_PROMPT}\n\n{caller}")
+    }
 }
 
 fn command_is_available(command: &str) -> bool {
@@ -655,6 +970,7 @@ fn classify_error(status: u16, body: String) -> ProviderError {
         429 => ProviderError::RateLimited(msg),
         401 | 403 => ProviderError::Auth(msg),
         404 => ProviderError::NotFound(msg),
+        400 | 422 => ProviderError::BadRequest(msg),
         500..=599 => ProviderError::Upstream(msg),
         _ => ProviderError::Network(format!("unexpected status {status}: {msg}")),
     }
@@ -663,6 +979,59 @@ fn classify_error(status: u16, body: String) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_puts_the_prompt_before_the_variadic_file_flag() {
+        let provider = Provider::new_cli(
+            "opencode",
+            "OpenCode",
+            ProviderKind::OpenCode,
+            "opencode",
+            "default",
+            ".",
+            60,
+        );
+        let (args, _) = provider.cli_args(
+            Some("opencode/x-preview-f-free"),
+            "describe this image",
+            "",
+            &["/tmp/a.png".to_string()],
+        );
+
+        let prompt_at = args.iter().position(|a| a == "describe this image");
+        let file_at = args.iter().position(|a| a == "--file");
+        assert!(prompt_at.is_some() && file_at.is_some());
+        // `--file` is variadic: a prompt after it is swallowed as a filename.
+        assert!(
+            prompt_at < file_at,
+            "prompt must precede --file, got {args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "/tmp/a.png");
+    }
+
+    #[test]
+    fn text_only_agents_refuse_image_requests_instead_of_guessing() {
+        assert!(ProviderKind::OpenCode.cli_supports_images());
+        assert!(ProviderKind::Codex.cli_supports_images());
+        // Agy and Claude Code have no image attachment flag; answering a vision
+        // request from them would be a hallucination about an unseen image.
+        assert!(!ProviderKind::Agy.cli_supports_images());
+        assert!(!ProviderKind::Claude.cli_supports_images());
+    }
+
+    #[test]
+    fn nvidia_worker_saturation_advances_the_model_ladder_but_still_blames_the_key() {
+        let err = ProviderError::Upstream(
+            "{\"error\":{\"message\":\"ResourceExhausted: Worker local total request limit reached (16/16)\"}}"
+                .to_string(),
+        );
+        assert!(err.is_model_specific(), "should try the next model");
+        assert!(err.blames_key(), "a saturated key still earns a cooldown");
+
+        let wrong_model = ProviderError::NotFound("no such model".to_string());
+        assert!(wrong_model.is_model_specific());
+        assert!(!wrong_model.blames_key(), "a bad model id is not the key's fault");
+    }
 
     #[test]
     fn parses_provider_aliases() {
@@ -713,7 +1082,7 @@ mod tests {
             "echo",
             "default",
             ".",
-            2,
+            10,
         );
         let request = ChatCompletionRequest {
             model: "agy".to_string(),
@@ -732,12 +1101,14 @@ mod tests {
             .chat_completion(&reqwest::Client::new(), &request)
             .await
             .unwrap();
+        // `echo` replays the rendered prompt, so this asserts the prompt shape
+        // the CLI actually receives.
+        let echoed = response.choices[0].message.content.as_text();
+        assert!(echoed.contains("## Your reply"), "prompt was: {echoed}");
+        assert!(echoed.contains("hello"));
         assert!(
-            response.choices[0]
-                .message
-                .content
-                .as_text()
-                .contains("ASSISTANT:")
+            !echoed.contains("USER:"),
+            "role headers make coding agents refuse the task: {echoed}"
         );
         assert!(response.usage.total_tokens > 0);
     }

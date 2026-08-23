@@ -4,7 +4,7 @@
 //! signal is received. Keeping this separate from `main.rs` makes it easy to start the
 //! server programmatically in integration tests.
 
-use crate::log_info;
+use crate::ログ_インフォ;
 use crate::{
     ai::router::AiRouter, config::Settings, database::Db, routes::create_router, state::AppState,
 };
@@ -28,13 +28,13 @@ pub async fn run(settings: Settings) -> Result<()> {
     let bind_addr = settings.bind_address();
     let listener = TcpListener::bind(&bind_addr).await?;
 
-    log_info!("{} listening on http://{}", settings.app.name, bind_addr);
+    ログ_インフォ!("{} listening on http://{}", settings.app.name, bind_addr);
 
     serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    log_info!("server stopped");
+    ログ_インフォ!("server stopped");
     Ok(())
 }
 
@@ -61,7 +61,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => log_info!("received Ctrl+C, shutting down"),
-        _ = terminate => log_info!("received SIGTERM, shutting down"),
+        _ = ctrl_c => ログ_インフォ!("received Ctrl+C, shutting down"),
+        _ = terminate => ログ_インフォ!("received SIGTERM, shutting down"),
     }
 }

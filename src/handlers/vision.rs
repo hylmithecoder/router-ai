@@ -42,25 +42,35 @@ pub async fn image_description(
         return Err(AppError::Validation("image field is required".to_string()));
     }
 
-    let image_url = normalize_image_url(image_input);
+    let image_url = crate::handlers::ocr::prepare_image_for_upstream(&state.http, image_input).await;
     let prompt = build_description_prompt(req.instruction.as_deref());
     let per_model_timeout = req.timeout_secs.unwrap_or(DEFAULT_VISION_TIMEOUT_SECS);
 
-    // Build the ordered model candidates to attempt
-    let mut model_queue: Vec<String> = Vec::new();
-    if let Some(m) = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto")) {
-        model_queue.push(m.to_string());
-    }
-    for &candidate in VISION_CANDIDATE_MODELS {
-        if !model_queue.iter().any(|m| m.eq_ignore_ascii_case(candidate)) {
-            model_queue.push(candidate.to_string());
-        }
-    }
+    // The router now rotates vision models and keys internally (and refuses to
+    // route an image to a text-only model), so this handler asks once and lets
+    // the router work the ladder instead of multiplying attempts N x M.
+    let target_model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("auto")
+        .to_string();
+
+    // Some upstreams refuse or fail to fetch remote URLs (Discord CDN links are
+    // signed and short-lived, and NVIDIA NIM rejects many hosts outright). When
+    // that happens, retry once with the bytes inlined as a data URI.
+    let mut image_sources = vec![image_url.clone()];
+    let mut inline_retry_available = image_url.starts_with("http");
 
     let started = std::time::Instant::now();
     let mut last_error_msg = String::from("no vision models available");
 
-    for target_model in &model_queue {
+    let mut source_index = 0;
+    while source_index < image_sources.len() {
+        let image_url = image_sources[source_index].clone();
+        source_index += 1;
+        let target_model = &target_model;
         let chat_req = ChatCompletionRequest {
             model: target_model.clone(),
             messages: vec![
@@ -146,9 +156,22 @@ pub async fn image_description(
                 tracing::warn!(
                     model = %target_model,
                     error = %msg,
-                    "vision model attempt failed, failing over to next model in queue"
+                    "vision attempt failed"
                 );
                 last_error_msg = format!("model {target_model} failed: {msg}");
+
+                if inline_retry_available && upstream_could_not_load_image(&msg) {
+                    inline_retry_available = false;
+                    match inline_image_as_data_uri(&state.http, &image_url).await {
+                        Some(data_uri) => {
+                            tracing::info!(
+                                "upstream could not fetch the image URL, retrying with inlined bytes"
+                            );
+                            image_sources.push(data_uri);
+                        }
+                        None => tracing::warn!("failed to inline image for upstream retry"),
+                    }
+                }
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -162,16 +185,27 @@ pub async fn image_description(
         }
     }
 
-    // Attempt local OCR/vision fallback before returning 503
+    // Attempt local OCR before giving up. This engine only reads text — it
+    // cannot judge whether an image is sensitive — so the result is explicitly
+    // marked unverified rather than reported as "safe". Callers doing
+    // moderation must treat this as "not checked", never as a clean verdict.
     if let Ok(local_text) = run_local_vision_fallback(image_input).await
         && !local_text.trim().is_empty()
     {
         let data = ImageDescriptionData {
-            description: format!("Locally analyzed image OCR fallback: {local_text}"),
+            description: format!(
+                "Pemindaian visual gagal; hanya teks yang berhasil dibaca secara lokal: {local_text}"
+            ),
             extracted_text: Some(local_text),
-            tags: vec!["local-ocr".to_string(), "fallback".to_string()],
+            tags: vec![
+                "local-ocr".to_string(),
+                "fallback".to_string(),
+                "unverified".to_string(),
+            ],
             is_sensitive: false,
-            safety_reason: None,
+            safety_reason: Some(
+                "unverified: model visual tidak tersedia, gambar belum dinilai".to_string(),
+            ),
             model: "local-vision-v1".to_string(),
             provider: "local".to_string(),
         };
@@ -255,29 +289,75 @@ async fn run_local_vision_fallback(image_input: &str) -> Result<String, String> 
 
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-        let text = val.get("raw_text")
+        let text = val
+            .get("raw_text")
             .or_else(|| val.get("plate_number"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim()
             .to_string();
-        if !text.is_empty() {
-            return Ok(text);
-        }
+        // An engine payload with no text read is a failure. Returning the raw
+        // JSON here is how a "Failed to decode input image" diagnostic used to
+        // reach callers dressed up as extracted image text.
+        return if text.is_empty() {
+            Err("local vision engine extracted no text".to_string())
+        } else {
+            Ok(text)
+        };
     }
     Ok(raw)
 }
 
-fn normalize_image_url(image_input: &str) -> String {
-    if image_input.starts_with("http://")
-        || image_input.starts_with("https://")
-        || image_input.starts_with("data:")
-    {
-        image_input.to_string()
-    } else {
-        format!("data:image/jpeg;base64,{image_input}")
-    }
+/// Does this upstream error mean the provider could not fetch the image URL?
+fn upstream_could_not_load_image(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    (m.contains("image") || m.contains("url"))
+        && (m.contains("failed to load")
+            || m.contains("failed to fetch")
+            || m.contains("could not download")
+            || m.contains("unable to download")
+            || m.contains("invalid image"))
 }
+
+/// Download an image and re-encode it as a data URI for upstreams that will not
+/// (or cannot) fetch the URL themselves.
+async fn inline_image_as_data_uri(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = client
+        .get(url)
+        // Plenty of image hosts answer 403 to a bare/default agent.
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        )
+        .header(reqwest::header::ACCEPT, "image/*,*/*;q=0.8")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.starts_with("image/"))
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() < 100 {
+        return None;
+    }
+
+    use base64::prelude::*;
+    Some(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(&bytes)
+    ))
+}
+
+
+
 
 fn build_description_prompt(custom_instruction: Option<&str>) -> String {
     let base = r#"Analyze and describe this image thoroughly.

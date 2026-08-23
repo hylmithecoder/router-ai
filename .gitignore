@@ -15,6 +15,12 @@ datasets/
 # Python & ML artifacts
 __pycache__/
 *.pyc
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
 runs/
 python-alpr-local/weights/
+python-alpr-local/.venv/
 

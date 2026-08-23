@@ -39,6 +39,7 @@ The AI Router acts as a high-performance, fault-tolerant gateway that fronts mul
 | `POST` | `/v1/chat/completions` | `Bearer <API_KEY>` | Standard OpenAI-compatible chat completion (JSON + SSE Stream) |
 | `POST` | `/api/v1/chat/completions` | `Bearer <API_KEY>` | Unified OpenAI-compatible chat completion with multi-provider scaling |
 | `POST` | `/api/v1/chat` | `Bearer <API_KEY>` | Unified router endpoint (defaults to `auto` pool including local agents) |
+| `POST` | `/api/v1/ocr/description` | `Bearer <API_KEY>` | Visual description, OCR extraction, and safety tags (aliased at `/api/v1/vision/description`) |
 | `POST` | `/api/v1/ocr/licenseplate` | `Bearer <API_KEY>` | Vehicle License Plate OCR using NVIDIA Multimodal Vision Models |
 | `GET` | `/v1/models` / `/api/v1/models` | `Bearer <API_KEY>` | List all active models and provider aliases |
 | `GET` | `/health` | Public | Liveness probe (`200 OK`) |
@@ -111,13 +112,142 @@ curl -X POST http://127.0.0.1:5790/api/v1/chat \
 
 ---
 
-### Strategy C: Multi-Key Automatic Failover & Cooldown
-If you configure multiple keys for a provider (e.g. `NVIDIA_API_KEYS=key1,key2` or `GROQ_API_KEYS=key1,key2`):
-1. The router sends the request to the first active key.
-2. If the provider returns `429 Too Many Requests`, `5xx Server Error`, or times out:
-   - The provider enters a temporary cooldown (configured by `ROUTER_PROVIDER_COOLDOWN_SECS`, default 60s).
-   - The router immediately fails over to the next candidate key.
-3. The client receives a transparent, uninterrupted response with zero downtime.
+### Strategy C: Two-Level Automatic Failover & Cooldown
+
+Failover happens on two levels, because "this model is wrong" and "this key is
+dead" are different problems and were previously treated the same.
+
+**Level 1 — model ladder (within one provider).** Each provider is tried against
+its configured model first, then the fallback ladder for its kind. A `400` or
+`404` means the model id is wrong or the request shape does not suit it; the
+router rotates to the next model on the *same* key and **does not** put that key
+in cooldown.
+
+**Level 2 — key rotation (across providers).** A `429`, `401/403`, `5xx`,
+timeout, or network error is the key's problem. That provider enters cooldown
+(`ROUTER_PROVIDER_COOLDOWN_SECS`, default 60s) and the router moves to the next
+candidate key.
+
+**Saturation is both.** NVIDIA NIM reports per-model worker saturation as a 503
+(`ResourceExhausted: Worker local total request limit reached (16/16)`). One
+model being full does not mean the key is dead, so the router works through the
+rest of the ladder first — and only then puts the key in cooldown.
+
+**Last resort.** If every candidate is enabled but sitting in cooldown, the
+router retries them anyway rather than returning `503`. A burst of failures can
+never leave a request with nothing to try.
+
+Providers that cannot possibly work — no API key configured, or a local CLI
+whose binary is not installed — are skipped up front instead of consuming a
+failover slot.
+
+Each individual provider+model attempt is bounded by
+`ROUTER_ATTEMPT_TIMEOUT_SECS` (default 90s) so one wedged upstream cannot hold
+the whole request open.
+
+The ladders are configurable:
+
+| Variable | Applies to | Default |
+|---|---|---|
+| `ROUTER_GROQ_FALLBACK_MODELS` | Groq keys, text requests | `openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b` |
+| `ROUTER_NVIDIA_FALLBACK_MODELS` | NVIDIA keys, text requests | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning,nvidia/nemotron-3-ultra-550b-a55b,google/gemma-4-31b-it` |
+| `ROUTER_VISION_FALLBACK_MODELS` | Any request containing an image | `google/diffusiongemma-26b-a4b-it,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning,google/gemma-4-31b-it,minimaxai/minimax-m3` |
+
+A request containing an image is only ever offered to vision-capable models and
+providers — the text ladders are not consulted, and local CLI agents (which
+cannot see images) are excluded.
+
+---
+
+### Strategy D: Local Agent CLIs as the Final Fallback
+
+When every HTTP key is exhausted, `auto` degrades to the locally installed agent
+CLIs. They are discovered from `PATH` at startup and sorted last in the pool.
+
+| Selector | CLI | Invocation |
+|---|---|---|
+| `opencode` | OpenCode | `run --format json --pure [--model M] <prompt>` |
+| `codex` | Codex CLI | `exec --ephemeral --sandbox read-only --skip-git-repo-check --ignore-user-config --color never [--model M] -` (prompt on stdin) |
+| `claude` | Claude Code | `--print --output-format json --no-session-persistence --system-prompt … --tools "" --permission-mode dontAsk [--model M] <prompt>` |
+| `agy` | Agy CLI | `--sandbox --disable-slash-commands --output-format text [--model M] --print=<prompt>` |
+
+Every agent is run non-interactively, sandboxed/read-only where the CLI offers
+it, with tools disabled and slash-command expansion off so message content
+cannot trigger them.
+
+Because agents are the last resort, `model: "auto"` makes them run on their
+cheapest model rather than whatever the CLI defaults to:
+
+| Variable | Default |
+|---|---|
+| `ROUTER_AGY_MODEL` | `gemini-3.5-flash-low` |
+| `ROUTER_CLAUDE_MODEL` | `haiku` |
+| `ROUTER_CODEX_MODEL` | *(CLI default)* |
+| `ROUTER_OPENCODE_MODEL` | *(CLI default)* |
+| `ROUTER_OPENCODE_VISION_MODEL` | `opencode/x-preview-f-free` |
+| `ROUTER_CODEX_VISION_MODEL` | *(CLI default)* |
+
+**Image attachments.** OpenCode (`--file`) and Codex (`--image`) accept images on
+the command line, so they remain in the pool for vision requests as the final
+fallback after every cloud vision model. The router downloads or base64-decodes
+each image into a temporary directory, passes the file paths to the agent, and
+deletes the directory when the process exits. Agy and Claude Code have no image
+flag and are excluded from image requests outright — answering a vision question
+from an agent that cannot see the image is a hallucination, not a fallback.
+
+Note that `--file` and `--image` are variadic, so the prompt is passed *before*
+them; a prompt placed afterwards is swallowed as another filename.
+
+Agent CLIs receive the chat request flattened into a single prompt. The caller's
+`system` messages are passed through the CLI's own system-prompt flag where one
+exists (Claude Code), and otherwise framed as the agent's configuration for the
+request. They are deliberately **not** rendered as `SYSTEM:` / `USER:` blocks:
+coding agents recognize that shape as an injected instruction frame and refuse
+the task instead of doing it.
+
+---
+
+## 3b. Vision: `POST /api/v1/ocr/description`
+
+```json
+{
+  "image": "https://cdn.discordapp.com/attachments/... | data:image/png;base64,...",
+  "instruction": "Evaluasi moderasi visual untuk server Discord.",
+  "model": "auto",
+  "timeout_secs": 200
+}
+```
+
+Routing notes:
+
+- The request is only ever offered to vision-capable models. A text-only model
+  is never handed an image, whatever `model` or `provider` says.
+- If the upstream cannot fetch the URL — expiring Discord CDN links, hosts that
+  answer `403` to datacenter IPs — the router retries once with the image bytes
+  downloaded and inlined as a `data:` URI.
+- `image` may be a URL, a `data:` URI, or bare base64.
+
+### Failure semantics for moderation callers
+
+When every vision model fails, the router falls back to the local OCR engine.
+That engine reads text; it **cannot judge whether an image is sensitive**. Its
+result is therefore returned as:
+
+```json
+{
+  "is_sensitive": false,
+  "safety_reason": "unverified: model visual tidak tersedia, gambar belum dinilai",
+  "tags": ["local-ocr", "fallback", "unverified"],
+  "provider": "local"
+}
+```
+
+`is_sensitive: false` here means **"nobody looked"**, not "this is fine". Any
+moderation client must check for `provider == "local"` or the `unverified` tag
+and treat the attachment as *not checked* — routing it to human review rather
+than passing it. Reporting it as a clean verdict would let anything through
+during an outage. If the local engine reads no text at all, the endpoint returns
+`503` instead of inventing a result.
 
 ---
 

@@ -35,7 +35,7 @@ const ENDPOINTS: ApiEndpoint[] = [
     category: "Chat & AI",
     summary: "Create Chat Completion (OpenAI-compatible)",
     description:
-      "Routes prompt across NVIDIA NIM, Groq, or local CLI agents with automatic failover and model selection.",
+      "Routes a prompt across NVIDIA NIM, Groq, or local CLI agents with automatic failover at both the model and the key level. Unavailable providers (missing key, uninstalled CLI) are skipped instead of consuming a failover slot.",
     auth: "API Key (Bearer)",
     defaultBody: JSON.stringify(
       {
@@ -192,7 +192,7 @@ const ENDPOINTS: ApiEndpoint[] = [
     category: "Computer Vision",
     summary: "General Visual Description & OCR Extractor",
     description:
-      "Analyzes any image with multi-teacher vision failover, extracting comprehensive natural description, visible typography, and safety tags.",
+      "Analyzes any image with multi-teacher vision failover, extracting a natural description, visible typography, and safety tags. Image requests are never routed to a text-only model. If the upstream cannot fetch the URL (expiring Discord CDN links, blocked hosts) the router retries once with the bytes inlined as a data URI. When every cloud vision model is exhausted it falls back to a local agent that accepts image attachments (OpenCode/Codex, on a free vision model), and only if that also fails to local OCR — which reads text but cannot judge safety, so that last result is tagged \"unverified\" with provider \"local\" and moderation callers must treat it as not-checked, never as safe.",
     auth: "API Key (Bearer)",
     defaultBody: JSON.stringify(
       {
@@ -292,6 +292,21 @@ const ENDPOINTS: ApiEndpoint[] = [
           2,
         ),
       },
+      {
+        name: "📦 Dataset Harvesting & Training (fortrain: true)",
+        body: JSON.stringify(
+          {
+            image:
+              "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=800",
+            instruction:
+              "Ekstrak plat nomor kendaraan untuk dataset training ALPR.",
+            model: "auto",
+            fortrain: true,
+          },
+          null,
+          2,
+        ),
+      },
     ],
   },
   {
@@ -311,11 +326,12 @@ const ENDPOINTS: ApiEndpoint[] = [
     category: "Chat & AI",
     summary: "Unified Chat Router Endpoint",
     description:
-      "Unified router endpoint with automatic fallback across HTTP providers (NVIDIA/Groq) and local CLI agents (OpenCode/Codex/Claude/Agy).",
+      "Unified router endpoint with two-level failover. Within a provider the router rotates through a model ladder (a 400/404 means the model is wrong, not the key, so it never triggers a cooldown); across providers it rotates through the keys, and finally retries providers that are in cooldown rather than failing. Set provider to auto (default), groq, nvidia, or a local agent id (opencode/codex/claude/agy). Local agents are last in the auto pool and run on their cheapest model.",
     auth: "API Key (Bearer)",
     defaultBody: JSON.stringify(
       {
-        model: "qwen/qwen3.6-27b",
+        provider: "auto",
+        model: "auto",
         messages: [
           {
             role: "user",
@@ -326,6 +342,60 @@ const ENDPOINTS: ApiEndpoint[] = [
       null,
       2,
     ),
+    presets: [
+      {
+        name: "Auto (cloud keys, then local agents)",
+        body: JSON.stringify(
+          {
+            provider: "auto",
+            model: "auto",
+            messages: [
+              { role: "user", content: "Sebutkan 3 fakta singkat tentang Rust." },
+            ],
+          },
+          null,
+          2,
+        ),
+      },
+      {
+        name: "Indonesian AutoMod classifier (JSON out)",
+        body: JSON.stringify(
+          {
+            provider: "auto",
+            model: "auto",
+            temperature: 0,
+            max_tokens: 320,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Anda classifier moderasi Discord Bahasa Indonesia. Balas HANYA satu objek JSON valid tanpa markdown dengan field: is_safe(boolean), category(string), severity(string), confidence(number), reason(string).",
+              },
+              {
+                role: "user",
+                content: "<discord_message>\nhalo semua, apa kabar?\n</discord_message>",
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+      },
+      {
+        name: "Force a local agent (Agy CLI)",
+        body: JSON.stringify(
+          {
+            provider: "agy",
+            model: "auto",
+            messages: [
+              { role: "user", content: "Balas HANYA dengan JSON {\"ok\":true}" },
+            ],
+          },
+          null,
+          2,
+        ),
+      },
+    ],
   },
   {
     id: "admin-dns-query",

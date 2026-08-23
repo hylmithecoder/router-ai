@@ -164,6 +164,32 @@ pub struct OcrSampleRow {
     pub model: String,
     pub provider: String,
     pub created_at: DateTime<Utc>,
+    /// Which path produced this sample: "cloud" or "local".
+    pub source: Option<String>,
+    /// Measured 0..1 confidence. Only the local engine reports one.
+    pub confidence_score: Option<f64>,
+    /// Detected plate box as `[x1, y1, x2, y2]`, when the engine localized it.
+    pub bbox: Option<[i64; 4]>,
+}
+
+/// A new OCR dataset sample to persist.
+///
+/// Grouped into a struct because the insert takes enough fields that positional
+/// arguments stop being readable at the call site.
+#[derive(Debug, Clone)]
+pub struct NewOcrSample<'a> {
+    pub id: &'a str,
+    pub image_filename: &'a str,
+    pub plate_number: &'a str,
+    pub vehicle_type: Option<&'a str>,
+    pub confidence: Option<&'a str>,
+    pub raw_text: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub model: &'a str,
+    pub provider: &'a str,
+    pub source: &'a str,
+    pub confidence_score: Option<f64>,
+    pub bbox: Option<[i64; 4]>,
 }
 
 /// Shared database handle.
@@ -260,7 +286,13 @@ impl Db {
                 description TEXT,
                 model TEXT NOT NULL,
                 provider TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                source TEXT,
+                confidence_score REAL,
+                bbox_x1 INTEGER,
+                bbox_y1 INTEGER,
+                bbox_x2 INTEGER,
+                bbox_y2 INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_ocr_samples_created ON ocr_license_plate_samples(created_at);
             "#,
@@ -272,6 +304,16 @@ impl Db {
         ensure_column(&conn, "providers", "kind", "TEXT NOT NULL DEFAULT 'groq'")?;
         ensure_column(&conn, "providers", "api_key_ciphertext", "TEXT")?;
         ensure_column(&conn, "providers", "command", "TEXT")?;
+
+        // The local ALPR engine reports where it found the plate. Storing that
+        // box turns every harvested sample into a real detection label, instead
+        // of the constant placeholder box the YOLO exporter used to invent.
+        let samples = "ocr_license_plate_samples";
+        ensure_column(&conn, samples, "source", "TEXT")?;
+        ensure_column(&conn, samples, "confidence_score", "REAL")?;
+        for col in ["bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"] {
+            ensure_column(&conn, samples, col, "INTEGER")?;
+        }
         Ok(())
     }
 
@@ -896,37 +938,34 @@ impl Db {
 
     /// Record a license plate OCR sample to the dataset collection table.
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_ocr_sample(
-        &self,
-        id: &str,
-        image_filename: &str,
-        plate_number: &str,
-        vehicle_type: Option<&str>,
-        confidence: Option<&str>,
-        raw_text: Option<&str>,
-        description: Option<&str>,
-        model: &str,
-        provider: &str,
-    ) -> Result<()> {
+    pub async fn insert_ocr_sample(&self, sample: NewOcrSample<'_>) -> Result<()> {
+        let bbox = sample.bbox.map(|b| b.map(Some)).unwrap_or([None; 4]);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"
             INSERT INTO ocr_license_plate_samples (
                 id, image_filename, plate_number, vehicle_type, confidence,
-                raw_text, description, model, provider, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                raw_text, description, model, provider, created_at,
+                source, confidence_score, bbox_x1, bbox_y1, bbox_x2, bbox_y2
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
-                id,
-                image_filename,
-                plate_number,
-                vehicle_type,
-                confidence,
-                raw_text,
-                description,
-                model,
-                provider,
-                Utc::now().to_rfc3339()
+                sample.id,
+                sample.image_filename,
+                sample.plate_number,
+                sample.vehicle_type,
+                sample.confidence,
+                sample.raw_text,
+                sample.description,
+                sample.model,
+                sample.provider,
+                Utc::now().to_rfc3339(),
+                sample.source,
+                sample.confidence_score,
+                bbox[0],
+                bbox[1],
+                bbox[2],
+                bbox[3],
             ],
         )?;
         Ok(())
@@ -938,7 +977,8 @@ impl Db {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, image_filename, plate_number, vehicle_type, confidence,
-                   raw_text, description, model, provider, created_at
+                   raw_text, description, model, provider, created_at,
+                   source, confidence_score, bbox_x1, bbox_y1, bbox_x2, bbox_y2
             FROM ocr_license_plate_samples
             ORDER BY created_at DESC
             LIMIT ?1
@@ -949,6 +989,12 @@ impl Db {
             let created_at = DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            // A box is only usable as a training label when all four corners are
+            // present; rows harvested before bbox capture have none of them.
+            let bbox = match (row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?) {
+                (Some(x1), Some(y1), Some(x2), Some(y2)) => Some([x1, y1, x2, y2]),
+                _ => None,
+            };
             Ok(OcrSampleRow {
                 id: row.get(0)?,
                 image_filename: row.get(1)?,
@@ -960,6 +1006,9 @@ impl Db {
                 model: row.get(7)?,
                 provider: row.get(8)?,
                 created_at,
+                source: row.get(10)?,
+                confidence_score: row.get(11)?,
+                bbox,
             })
         })?;
 
@@ -1070,17 +1119,20 @@ mod tests {
     #[tokio::test]
     async fn ocr_sample_harvesting() {
         let db = Db::open_in_memory().await.unwrap();
-        db.insert_ocr_sample(
-            "sample-1",
-            "sample-1.jpg",
-            "B 1234 ABC",
-            Some("car"),
-            Some("high"),
-            Some("B 1234 ABC 05.28"),
-            Some("Black SUV"),
-            "gemma-vision",
-            "nvidia",
-        )
+        db.insert_ocr_sample(NewOcrSample {
+            id: "sample-1",
+            image_filename: "sample-1.jpg",
+            plate_number: "B 1234 ABC",
+            vehicle_type: Some("car"),
+            confidence: Some("high"),
+            raw_text: Some("B 1234 ABC 05.28"),
+            description: Some("Black SUV"),
+            model: "gemma-vision",
+            provider: "nvidia",
+            source: "cloud",
+            confidence_score: None,
+            bbox: None,
+        })
         .await
         .unwrap();
 
@@ -1090,5 +1142,33 @@ mod tests {
         assert_eq!(samples[0].plate_number, "B 1234 ABC");
         assert_eq!(samples[0].vehicle_type.as_deref(), Some("car"));
         assert_eq!(samples[0].confidence.as_deref(), Some("high"));
+        assert_eq!(samples[0].source.as_deref(), Some("cloud"));
+        assert_eq!(samples[0].bbox, None);
+    }
+
+    #[tokio::test]
+    async fn ocr_sample_stores_detection_box() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.insert_ocr_sample(NewOcrSample {
+            id: "sample-2",
+            image_filename: "sample-2.jpg",
+            plate_number: "BK 5379 WAJ",
+            vehicle_type: Some("motorcycle"),
+            confidence: Some("high"),
+            raw_text: None,
+            description: None,
+            model: "local-alpr-v1",
+            provider: "local",
+            source: "local",
+            confidence_score: Some(0.94),
+            bbox: Some([706, 971, 1028, 1111]),
+        })
+        .await
+        .unwrap();
+
+        let samples = db.list_ocr_samples(10).await.unwrap();
+        assert_eq!(samples[0].source.as_deref(), Some("local"));
+        assert_eq!(samples[0].confidence_score, Some(0.94));
+        assert_eq!(samples[0].bbox, Some([706, 971, 1028, 1111]));
     }
 }

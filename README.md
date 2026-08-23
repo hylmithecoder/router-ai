@@ -171,7 +171,6 @@ cd webui && bun run lint && bun run build
 
 ## Production checklist
 
-- [ ] Set real values in environment (never commit `.env`)
 - [ ] Restrict `CorsLayer::permissive()` to real origins
 - [ ] `make build` then `make run-prod` (single static binary on one port)
 

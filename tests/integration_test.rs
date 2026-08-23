@@ -1022,7 +1022,8 @@ async fn license_plate_ocr_successful_recognition() {
                 .body(Body::from(
                     json!({
                         "image": "data:image/jpeg;base64,fakeimagebytes",
-                        "instruction": "Tolong baca plat nomor mobil ini"
+                        "instruction": "Tolong baca plat nomor mobil ini",
+                        "fortrain": true
                     })
                     .to_string(),
                 ))
@@ -1051,6 +1052,45 @@ async fn license_plate_ocr_successful_recognition() {
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0].plate_number, "B 1234 ABC");
     assert_eq!(samples[0].vehicle_type.as_deref(), Some("car"));
+}
+
+#[tokio::test]
+async fn license_plate_ocr_skips_dataset_harvesting_when_not_for_train() {
+    let mock_ocr = spawn_mock(ocr_vision_upstream()).await;
+    let (app, state) = test_app_full(
+        "master",
+        vec![],
+        vec![NvidiaKeySpec {
+            key: "nv-ocr-1".into(),
+            base_url: mock_ocr,
+        }],
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ocr/licenseplate")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-test")
+                .body(Body::from(
+                    json!({
+                        "image": "data:image/jpeg;base64,fakeimagebytes",
+                        "fortrain": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let samples = state.db.list_ocr_samples(10).await.unwrap();
+    assert_eq!(samples.len(), 0, "should not harvest dataset sample when fortrain is false");
 }
 
 #[tokio::test]

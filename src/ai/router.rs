@@ -11,7 +11,10 @@ use tokio::sync::RwLock;
 
 use crate::{
     ai::{
-        dto::{ChatCompletionRequest, CompletionOutcome, RouterError, StreamOutcome, StreamSource},
+        dto::{
+            ChatCompletionRequest, ChatCompletionResponse, CompletionOutcome, RouterError,
+            StreamOutcome, StreamSource,
+        },
         provider::{Provider, ProviderError, ProviderKind},
     },
     config::Settings,
@@ -114,6 +117,12 @@ impl AiRouter {
     }
 
     /// Try each selected provider in order until one succeeds.
+    ///
+    /// Failover happens on two levels: within a provider we rotate through the
+    /// model candidates (a 400/404 means the *model* is wrong, not the key),
+    /// and across providers we rotate through the keys. A final pass retries
+    /// providers that are in cooldown, so a burst of failures can never leave
+    /// the request with nothing to try.
     pub async fn complete(
         &self,
         req: &ChatCompletionRequest,
@@ -124,19 +133,15 @@ impl AiRouter {
             .await?;
         let mut last_error: Option<String> = None;
 
-        for (id, provider) in candidates {
-            if !provider.enabled || provider.in_cooldown() {
-                continue;
-            }
-
-            match provider.chat_completion(&self.client, req).await {
-                Ok(response) => {
+        for (id, provider) in self.attempt_order(candidates) {
+            match self.try_provider_models(&provider, req, has_images).await {
+                Ok((model, response)) => {
                     self.mark_success(&id).await;
                     return Ok(CompletionOutcome {
                         provider_id: id,
                         provider_name: provider.name,
                         model: if response.model.is_empty() {
-                            provider.model
+                            model
                         } else {
                             response.model.clone()
                         },
@@ -145,10 +150,12 @@ impl AiRouter {
                 }
                 Err(err) => {
                     let msg = provider_error_message(&err);
+                    tracing::warn!(provider = %id, error = %msg, "provider failed, falling over");
                     last_error = Some(msg.clone());
-                    self.mark_failure(&id, &msg).await;
-                    if is_client_error(&err) {
-                        return Err(RouterError::ClientError(msg));
+                    // A bad model id says nothing about the key's health, so it
+                    // must not park the key in cooldown.
+                    if err.blames_key() {
+                        self.mark_failure(&id, &msg).await;
                     }
                 }
             }
@@ -157,6 +164,65 @@ impl AiRouter {
         Err(RouterError::AllProvidersFailed(
             last_error.unwrap_or_else(|| "no providers available".to_string()),
         ))
+    }
+
+    /// Order the candidates into the sequence to actually try: healthy providers
+    /// first, then the ones sitting in cooldown as a last resort.
+    fn attempt_order(&self, candidates: Vec<(String, Provider)>) -> Vec<(String, Provider)> {
+        let (ready, cooling): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .filter(|(_, provider)| provider.enabled)
+            .partition(|(_, provider)| !provider.in_cooldown());
+        ready.into_iter().chain(cooling).collect()
+    }
+
+    /// Try one provider against each of its model candidates in turn.
+    async fn try_provider_models(
+        &self,
+        provider: &Provider,
+        req: &ChatCompletionRequest,
+        has_images: bool,
+    ) -> Result<(String, ChatCompletionResponse), ProviderError> {
+        let models = model_candidates(provider, &req.model, has_images);
+        let mut last: Option<ProviderError> = None;
+
+        let budget = attempt_timeout(provider);
+        for model in models {
+            let mut attempt = req.clone();
+            attempt.model = model.clone();
+            let call = provider.chat_completion(&self.client, &attempt);
+            // A wedged upstream must not hold the whole request hostage; a
+            // stalled model is just another reason to rotate.
+            let result = match tokio::time::timeout(budget, call).await {
+                Ok(result) => result,
+                Err(_) => Err(ProviderError::Network(format!(
+                    "model {model} timed out after {}s",
+                    budget.as_secs()
+                ))),
+            };
+
+            match result {
+                Ok(response) => return Ok((model, response)),
+                Err(err) => {
+                    let retry_next_model = err.is_model_specific();
+                    tracing::warn!(
+                        provider = %provider.id,
+                        model = %model,
+                        error = %provider_error_message(&err),
+                        retry_next_model,
+                        "model attempt failed"
+                    );
+                    last = Some(err);
+                    if !retry_next_model {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(last.unwrap_or_else(|| {
+            ProviderError::Network("no model candidates for provider".to_string())
+        }))
     }
 
     /// Route a streaming request. HTTP providers are passed through as SSE;
@@ -168,16 +234,15 @@ impl AiRouter {
             .await?;
         let mut last_error: Option<String> = None;
 
-        for (id, provider) in candidates {
-            if !provider.enabled || provider.in_cooldown() {
-                continue;
-            }
-
+        for (id, provider) in self.attempt_order(candidates) {
             if provider.kind.is_cli() {
                 let mut non_stream = req.clone();
                 non_stream.stream = Some(false);
-                match provider.chat_completion(&self.client, &non_stream).await {
-                    Ok(response) => {
+                match self
+                    .try_provider_models(&provider, &non_stream, has_images)
+                    .await
+                {
+                    Ok((_, response)) => {
                         self.mark_success(&id).await;
                         return Ok(StreamOutcome {
                             provider_id: id,
@@ -189,31 +254,29 @@ impl AiRouter {
                     Err(err) => {
                         let msg = provider_error_message(&err);
                         last_error = Some(msg.clone());
-                        self.mark_failure(&id, &msg).await;
-                        if is_client_error(&err) {
-                            return Err(RouterError::ClientError(msg));
+                        if err.blames_key() {
+                            self.mark_failure(&id, &msg).await;
                         }
                     }
                 }
                 continue;
             }
 
-            match provider.stream_chat(&self.client, req).await {
-                Ok(response) => {
+            match self.try_stream_models(&provider, req, has_images).await {
+                Ok((model, response)) => {
                     self.mark_success(&id).await;
                     return Ok(StreamOutcome {
                         provider_id: id,
                         provider_name: provider.name,
-                        model: req.model.clone().if_empty_then(provider.model),
+                        model,
                         source: StreamSource::Http(response),
                     });
                 }
                 Err(err) => {
                     let msg = provider_error_message(&err);
                     last_error = Some(msg.clone());
-                    self.mark_failure(&id, &msg).await;
-                    if is_client_error(&err) {
-                        return Err(RouterError::ClientError(msg));
+                    if err.blames_key() {
+                        self.mark_failure(&id, &msg).await;
                     }
                 }
             }
@@ -222,6 +285,36 @@ impl AiRouter {
         Err(RouterError::AllProvidersFailed(
             last_error.unwrap_or_else(|| "no providers available".to_string()),
         ))
+    }
+
+    /// Streaming counterpart of [`Self::try_provider_models`].
+    async fn try_stream_models(
+        &self,
+        provider: &Provider,
+        req: &ChatCompletionRequest,
+        has_images: bool,
+    ) -> Result<(String, reqwest::Response), ProviderError> {
+        let models = model_candidates(provider, &req.model, has_images);
+        let mut last: Option<ProviderError> = None;
+
+        for model in models {
+            let mut attempt = req.clone();
+            attempt.model = model.clone();
+            match provider.stream_chat(&self.client, &attempt).await {
+                Ok(response) => return Ok((model, response)),
+                Err(err) => {
+                    let retry_next_model = err.is_model_specific();
+                    last = Some(err);
+                    if !retry_next_model {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(last.unwrap_or_else(|| {
+            ProviderError::Network("no model candidates for provider".to_string())
+        }))
     }
 
     /// Automatically pick or validate the best available vision model for multimodal tasks.
@@ -258,9 +351,32 @@ impl AiRouter {
 
         let mut out = Vec::new();
         for provider in providers.iter() {
-            // When images are present in the request, do not route to text-only CLI tools
-            if has_images && provider.kind.is_cli() {
+            // A provider with no key, or a CLI whose binary was uninstalled,
+            // can only ever fail. Skipping it here keeps it from burning a
+            // failover slot and from polluting the reported error.
+            if !provider.is_available() {
                 continue;
+            }
+
+            // When images are present, only providers that can actually see may
+            // serve the request: vision-capable HTTP endpoints, plus the agent
+            // CLIs that accept image attachments as a last resort. A text-only
+            // endpoint would either 400 or answer about nothing.
+            let explicitly_named = selector.is_some_and(|value| {
+                provider.id.eq_ignore_ascii_case(value) || provider.name.eq_ignore_ascii_case(value)
+            });
+            let image_capable_cli = provider.kind.is_cli() && provider.kind.cli_supports_images();
+            if has_images && !explicitly_named {
+                let can_see = if provider.kind.is_cli() {
+                    image_capable_cli
+                } else {
+                    provider.kind == ProviderKind::Nvidia
+                        || is_vision_model(&provider.model)
+                        || requested_model.map(is_vision_model).unwrap_or(false)
+                };
+                if !can_see {
+                    continue;
+                }
             }
 
             let matches = match selector {
@@ -287,6 +403,7 @@ impl AiRouter {
                         provider.kind == ProviderKind::Nvidia
                             || is_vision_model(&provider.model)
                             || requested_model.map(is_vision_model).unwrap_or(false)
+                            || image_capable_cli
                     } else if let Some(model) = requested_model {
                         if is_nvidia_model(model)
                             || (provider.kind == ProviderKind::Nvidia
@@ -459,16 +576,129 @@ fn provider_error_message(err: &ProviderError) -> String {
         ProviderError::RateLimited(m) => format!("rate limited: {m}"),
         ProviderError::Auth(m) => format!("auth failed: {m}"),
         ProviderError::NotFound(m) => format!("not found: {m}"),
+        ProviderError::BadRequest(m) => format!("bad request: {m}"),
         ProviderError::Upstream(m) => format!("upstream error: {m}"),
         ProviderError::Network(m) => format!("network error: {m}"),
     }
 }
 
-/// Client errors that should not be retried against another provider.
-/// Upstream provider errors (503 Service Unavailable, 429 Rate Limit, 401/403 Invalid Key, 500, Network)
-/// should always fall back to the next available key in the provider pool.
-fn is_client_error(_err: &ProviderError) -> bool {
-    false
+/// Ordered model ids to try on one provider for a single request.
+///
+/// Local CLIs keep whatever the caller asked for — the CLI resolves its own
+/// cheap default for aliases like `auto`. HTTP providers get their configured
+/// model first, then the kind's fallback ladder, so a request never dies just
+/// because one model id was retired or is the wrong shape for the task.
+fn model_candidates(provider: &Provider, requested: &str, has_images: bool) -> Vec<String> {
+    if provider.kind.is_cli() {
+        return vec![requested.to_string()];
+    }
+
+    let requested = requested.trim();
+    let explicit = (!requested.is_empty()
+        && !is_provider_alias_model(requested)
+        && !provider.id.eq_ignore_ascii_case(requested))
+    .then(|| requested.to_string());
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |model: String| {
+        if !model.trim().is_empty()
+            && model != "default"
+            && !out.iter().any(|m| m.eq_ignore_ascii_case(&model))
+        {
+            out.push(model);
+        }
+    };
+
+    if let Some(model) = explicit {
+        push(model);
+    }
+    push(provider.model.clone());
+    for model in fallback_models(provider.kind, has_images) {
+        push(model);
+    }
+
+    if has_images {
+        // A text-only model given an image part answers with a 400 at best and
+        // hallucinates at worst; never let a vision task land on one.
+        let vision: Vec<String> = out.iter().filter(|m| is_vision_model(m)).cloned().collect();
+        if !vision.is_empty() {
+            return vision;
+        }
+    }
+
+    if out.is_empty() {
+        out.push(provider.model.clone());
+    }
+    out
+}
+
+/// Wall-clock budget for a single provider+model attempt, so one stalled
+/// upstream cannot consume the caller's entire timeout. Local CLIs keep their
+/// own (longer) process budget. Override with `ROUTER_ATTEMPT_TIMEOUT_SECS`.
+fn attempt_timeout(provider: &Provider) -> std::time::Duration {
+    let secs = std::env::var("ROUTER_ATTEMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90)
+        .max(5);
+    let secs = if provider.kind.is_cli() {
+        secs.max(provider.cli_timeout_secs + 5)
+    } else {
+        secs
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+fn is_provider_alias_model(model: &str) -> bool {
+    ["auto", "default", "router", "groq", "nvidia"]
+        .iter()
+        .any(|alias| model.eq_ignore_ascii_case(alias))
+}
+
+/// Fallback ladder per provider kind, overridable with comma-separated env vars:
+/// `ROUTER_GROQ_FALLBACK_MODELS`, `ROUTER_NVIDIA_FALLBACK_MODELS`,
+/// `ROUTER_VISION_FALLBACK_MODELS`.
+fn fallback_models(kind: ProviderKind, has_images: bool) -> Vec<String> {
+    let (var, defaults): (&str, &[&str]) = if has_images {
+        (
+            "ROUTER_VISION_FALLBACK_MODELS",
+            &[
+                "google/diffusiongemma-26b-a4b-it",
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                "google/gemma-4-31b-it",
+                "minimaxai/minimax-m3",
+            ],
+        )
+    } else {
+        match kind {
+            ProviderKind::Groq => (
+                "ROUTER_GROQ_FALLBACK_MODELS",
+                &[
+                    "openai/gpt-oss-120b",
+                    "llama-3.3-70b-versatile",
+                    "openai/gpt-oss-20b",
+                ],
+            ),
+            ProviderKind::Nvidia => (
+                "ROUTER_NVIDIA_FALLBACK_MODELS",
+                &[
+                    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                    "nvidia/nemotron-3-ultra-550b-a55b",
+                    "google/gemma-4-31b-it",
+                ],
+            ),
+            _ => return Vec::new(),
+        }
+    };
+
+    match std::env::var(var) {
+        Ok(raw) => raw
+            .split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect(),
+        Err(_) => defaults.iter().map(ToString::to_string).collect(),
+    }
 }
 
 pub fn is_groq_model(model: &str) -> bool {
@@ -543,12 +773,45 @@ fn provider_relevance(provider: &Provider, requested_model: Option<&str>, has_im
     }
 }
 
-trait EmptyStringFallback {
-    fn if_empty_then(self, fallback: String) -> String;
-}
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
 
-impl EmptyStringFallback for String {
-    fn if_empty_then(self, fallback: String) -> String {
-        if self.is_empty() { fallback } else { self }
+    fn http_provider(kind: ProviderKind, model: &str) -> Provider {
+        Provider::new_http("p1", "P1", kind, "https://example.com", Some("k"), model)
+    }
+
+    #[test]
+    fn auto_expands_to_the_provider_model_then_the_kind_ladder() {
+        let provider = http_provider(ProviderKind::Groq, "openai/gpt-oss-120b");
+        let models = model_candidates(&provider, "auto", false);
+        assert_eq!(models.first().unwrap(), "openai/gpt-oss-120b");
+        assert!(models.contains(&"llama-3.3-70b-versatile".to_string()));
+        assert!(models.len() > 1, "auto must have somewhere to fall back to");
+    }
+
+    #[test]
+    fn explicit_model_is_tried_first_but_still_has_fallbacks() {
+        let provider = http_provider(ProviderKind::Nvidia, "nvidia/nemotron-3-ultra-550b-a55b");
+        let models = model_candidates(&provider, "google/gemma-4-31b-it", false);
+        assert_eq!(models.first().unwrap(), "google/gemma-4-31b-it");
+        assert!(models.contains(&"nvidia/nemotron-3-ultra-550b-a55b".to_string()));
+    }
+
+    #[test]
+    fn image_requests_never_fall_back_to_a_text_only_model() {
+        let provider = http_provider(ProviderKind::Nvidia, "nvidia/nemotron-3-ultra-550b-a55b");
+        let models = model_candidates(&provider, "auto", true);
+        assert!(!models.is_empty());
+        assert!(
+            models.iter().all(|m| is_vision_model(m)),
+            "text-only models leaked into a vision request: {models:?}"
+        );
+    }
+
+    #[test]
+    fn local_agents_keep_the_requested_alias() {
+        let provider = Provider::new_cli("agy", "Agy", ProviderKind::Agy, "agy", "default", ".", 60);
+        assert_eq!(model_candidates(&provider, "auto", false), vec!["auto"]);
     }
 }

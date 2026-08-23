@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use router_api_ai::config::Settings;
-use router_api_ai::log_info;
 use router_api_ai::server;
+use router_api_ai::ログ_インフォ;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
 
     // Load configuration. Missing variables fall back to sensible defaults.
     let settings = Settings::new();
-    log_info!("starting {}", settings.app.name);
+    ログ_インフォ!("スタート {}", settings.app.name);
 
     // Hand control to the server module. It blocks until a shutdown signal is received.
     server::run(settings).await

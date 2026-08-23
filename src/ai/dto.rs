@@ -188,6 +188,9 @@ pub struct LicensePlateOcrRequest {
     /// Optional additional instruction / prompt override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// Optional flag: if true, saves the image & metadata to `datasets/` for training/fine-tuning.
+    #[serde(default, alias = "fortrain", alias = "for_train", alias = "is_train", alias = "train", alias = "dataset")]
+    pub for_train: Option<bool>,
 }
 
 /// Structured vehicle license plate recognition result.
@@ -211,6 +214,13 @@ pub struct LicensePlateData {
     pub model: String,
     /// Upstream provider used for OCR.
     pub provider: String,
+    /// Measured 0..1 recognition confidence. Only the local ALPR engine reports
+    /// one; cloud vision models return the coarse `confidence` label instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_score: Option<f64>,
+    /// Detected plate region as `[x1, y1, x2, y2]` in source-image pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[i64; 4]>,
 }
 
 /// Standard envelope for license plate OCR responses.
@@ -239,6 +249,9 @@ pub struct ImageDescriptionRequest {
     /// Optional timeout in seconds before switching to the next vision model (default: 15s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Optional flag: if true, saves the image & metadata to `datasets/` for training/fine-tuning.
+    #[serde(default, alias = "fortrain", alias = "for_train", alias = "is_train", alias = "train", alias = "dataset")]
+    pub for_train: Option<bool>,
 }
 
 /// Structured outcome of general visual description & text extraction.
