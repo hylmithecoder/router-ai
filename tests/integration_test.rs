@@ -1368,3 +1368,69 @@ async fn license_plate_ocr_falls_back_to_local_engine_when_providers_fail() {
     let status = response.status();
     assert!(status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn serves_embedded_static_assets_and_nextjs_routes() {
+    let (app, _) = test_app("master", vec![]).await;
+
+    // 1. Root index.html
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.contains("text/html"));
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!body_bytes.is_empty());
+
+    // 2. Client-side route without .html (e.g. /docs)
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/docs")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.contains("text/html"));
+
+    // 3. 404 route returns 404 status
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/nonexistent-page-xyz")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
