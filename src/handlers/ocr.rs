@@ -10,8 +10,8 @@ use serde_json::Value;
 use crate::{
     ai::dto::{
         ChatCompletionRequest, ChatContentPart, ChatMessage, ChatMessageContent,
-        ImageUrlDetail, LicensePlateData, LicensePlateOcrRequest, LicensePlateOcrResponse,
-        RouterError,
+        CompletionOutcome, ImageUrlDetail, LicensePlateData, LicensePlateOcrRequest,
+        LicensePlateOcrResponse, RouterError,
     },
     error::AppError,
     middleware::AuthKey,
@@ -27,6 +27,143 @@ pub const SUPPORTED_VISION_MODELS: &[&str] = &[
 ];
 
 pub const DEFAULT_OCR_MODEL: &str = "google/diffusiongemma-26b-a4b-it";
+
+/// Local agentic OCR order. Each CLI is invoked with a model that is known to
+/// be useful for visual OCR, then the handler falls through to cloud vision
+/// and the deterministic local ALPR engine if no agent returns a usable plate.
+const LOCAL_OCR_AGENT_ORDER: &[(&str, &str)] = &[
+    ("agy", "gemini-3.5-flash"),
+    ("claude", "haiku"),
+    ("codex", "gpt-5.5"),
+    ("opencode", "opencode/x-preview-f-free"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalOcrAttempt {
+    provider: &'static str,
+    model: String,
+}
+
+/// Select the local agentic OCR chain for the default route, or one explicit
+/// local provider when the caller asks for it. Explicit cloud providers keep
+/// their existing behavior and skip this chain.
+fn local_ocr_agent_plan(req: &LicensePlateOcrRequest) -> Vec<LocalOcrAttempt> {
+    let requested_provider = req
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_is_auto = requested_provider
+        .map(|value| value.eq_ignore_ascii_case("auto"))
+        .unwrap_or(true);
+
+    let provider = if provider_is_auto {
+        req.model
+            .as_deref()
+            .and_then(canonical_local_provider)
+    } else {
+        canonical_local_provider(requested_provider.unwrap_or_default())
+    };
+
+    if let Some(provider) = provider {
+        let model = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !is_agent_model_alias(value))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| default_local_ocr_model(provider).to_string());
+        return vec![LocalOcrAttempt { provider, model }];
+    }
+
+    let model_is_auto = req
+        .model
+        .as_deref()
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty() || value.eq_ignore_ascii_case("auto")
+        })
+        .unwrap_or(true);
+    if provider_is_auto && model_is_auto {
+        return LOCAL_OCR_AGENT_ORDER
+            .iter()
+            .map(|(provider, model)| LocalOcrAttempt {
+                provider,
+                model: (*model).to_string(),
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn canonical_local_provider(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "agy" | "agy-cli" => Some("agy"),
+        "claude" | "claude-code" => Some("claude"),
+        "codex" | "codex-cli" => Some("codex"),
+        "opencode" | "open-code" => Some("opencode"),
+        _ => None,
+    }
+}
+
+fn is_agent_model_alias(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("auto")
+        || value.eq_ignore_ascii_case("default")
+        || value.eq_ignore_ascii_case("router")
+        || canonical_local_provider(value).is_some()
+}
+
+fn default_local_ocr_model(provider: &str) -> &'static str {
+    LOCAL_OCR_AGENT_ORDER
+        .iter()
+        .find(|(candidate, _)| *candidate == provider)
+        .map(|(_, model)| *model)
+        .unwrap_or("gpt-5.5")
+}
+
+fn build_ocr_chat_request(
+    image_url: String,
+    prompt: String,
+    model: String,
+    provider: Option<String>,
+) -> ChatCompletionRequest {
+    let enable_gemma_thinking = model.to_ascii_lowercase().contains("gemma");
+    ChatCompletionRequest {
+        model,
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: ChatMessageContent::Text(
+                    "You are an expert vehicle license plate OCR and computer vision analyst. Always output pure JSON without markdown formatting.".to_string(),
+                ),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: ChatMessageContent::Parts(vec![
+                    ChatContentPart::Text { text: prompt },
+                    ChatContentPart::ImageUrl {
+                        image_url: ImageUrlDetail {
+                            url: image_url,
+                            detail: Some("high".to_string()),
+                        },
+                    },
+                ]),
+            },
+        ],
+        temperature: Some(0.1),
+        max_tokens: Some(1024),
+        stream: Some(false),
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        chat_template_kwargs: enable_gemma_thinking
+            .then(|| serde_json::json!({ "enable_thinking": true })),
+        provider,
+    }
+}
 
 /// Base URL of the persistent local ALPR server (`python-alpr-local/server.py`).
 fn local_alpr_url() -> String {
@@ -86,7 +223,9 @@ fn datasets_dir() -> std::path::PathBuf {
 /// `POST /api/v1/ocr/licenseplate`
 ///
 /// Recognizes and extracts vehicle license plate details from an image.
-/// Automatically selects an active vision model or uses the explicitly requested model.
+/// By default it tries local agentic OCR in priority order, then cloud vision
+/// and the deterministic ALPR fallback; explicit provider/model overrides are
+/// respected.
 pub async fn license_plate_ocr(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthKey>,
@@ -118,48 +257,92 @@ pub async fn license_plate_ocr(
     let image_url = prepare_image_for_upstream(&state.http, image_input).await;
     let prompt = build_ocr_prompt(req.instruction.as_deref());
 
+    // OCR defaults to the local agentic chain requested by the operator. A
+    // model/provider override can still target one local agent or the cloud
+    // path directly. A successful process is not enough: only a plausible
+    // plate read wins, so a text-only apology or malformed JSON falls through
+    // to the next agent.
+    let local_ocr_plan = local_ocr_agent_plan(&req);
+    let local_agent_was_attempted = !local_ocr_plan.is_empty();
+    for attempt in &local_ocr_plan {
+        let local_req = build_ocr_chat_request(
+            image_url.clone(),
+            prompt.clone(),
+            attempt.model.clone(),
+            Some(attempt.provider.to_string()),
+        );
+        match state.router.complete(&local_req).await {
+            Ok(outcome) => {
+                let content = outcome
+                    .response
+                    .choices
+                    .first()
+                    .map(|choice| choice.message.content.as_text())
+                    .unwrap_or_default();
+                let data = parse_license_plate_output(
+                    &content,
+                    &outcome.model,
+                    &outcome.provider_name,
+                );
+
+                if !is_plausible_plate(&data.plate_number) {
+                    tracing::warn!(
+                        provider = attempt.provider,
+                        model = %attempt.model,
+                        "local agent returned no plausible license plate; trying next OCR provider"
+                    );
+                    continue;
+                }
+
+                if for_train {
+                    record_ocr_sample_background(
+                        state.db.clone(),
+                        state.http.clone(),
+                        image_input.to_string(),
+                        data.clone(),
+                        "agentic",
+                    );
+                }
+                record_ocr_usage(
+                    &state,
+                    &auth.id,
+                    &outcome,
+                    started,
+                    StatusCode::OK.as_u16() as i64,
+                )
+                .await;
+
+                return Ok(Json(LicensePlateOcrResponse {
+                    success: true,
+                    data,
+                    usage: outcome.response.usage,
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider = attempt.provider,
+                    model = %attempt.model,
+                    error = ?err,
+                    "local agent OCR attempt failed; trying next OCR provider"
+                );
+            }
+        }
+    }
+
     // Auto-pick active vision model or use requested model
     let target_model = state
         .router
         .resolve_vision_model(req.model.as_deref())
         .await;
 
-    let chat_req = ChatCompletionRequest {
-        model: target_model.clone(),
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: ChatMessageContent::Text(
-                    "You are an expert vehicle license plate OCR and computer vision analyst. Always output pure JSON without markdown formatting.".to_string(),
-                ),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: ChatMessageContent::Parts(vec![
-                    ChatContentPart::Text { text: prompt },
-                    ChatContentPart::ImageUrl {
-                        image_url: ImageUrlDetail {
-                            url: image_url,
-                            detail: Some("high".to_string()),
-                        },
-                    },
-                ]),
-            },
-        ],
-        temperature: Some(0.1),
-        max_tokens: Some(1024),
-        stream: Some(false),
-        top_p: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        chat_template_kwargs: if target_model.contains("gemma") {
-            Some(serde_json::json!({ "enable_thinking": true }))
-        } else {
-            None
-        },
-        provider: req.provider.clone(),
+    // Do not repeat the local chain after it has already been exhausted. The
+    // cloud pass is intentionally constrained to NVIDIA's vision pool.
+    let cloud_provider = if local_agent_was_attempted {
+        Some("nvidia".to_string())
+    } else {
+        req.provider.clone()
     };
+    let chat_req = build_ocr_chat_request(image_url, prompt, target_model.clone(), cloud_provider);
 
     match state.router.complete(&chat_req).await {
         Ok(outcome) => {
@@ -198,19 +381,14 @@ pub async fn license_plate_ocr(
                 );
             }
 
-            let latency = started.elapsed().as_millis() as i64;
-            let _ = state
-                .db
-                .insert_usage(
-                    &auth.id,
-                    &outcome.model,
-                    &outcome.provider_id,
-                    outcome.response.usage.prompt_tokens,
-                    outcome.response.usage.completion_tokens,
-                    latency,
-                    StatusCode::OK.as_u16() as i64,
-                )
-                .await;
+            record_ocr_usage(
+                &state,
+                &auth.id,
+                &outcome,
+                started,
+                StatusCode::OK.as_u16() as i64,
+            )
+            .await;
 
             Ok(Json(LicensePlateOcrResponse {
                 success: true,
@@ -223,6 +401,16 @@ pub async fn license_plate_ocr(
                 RouterError::NoProviders => (503, "no providers configured".to_string()),
                 RouterError::AllProvidersFailed(msg) => {
                     (503, format!("all providers failed: {msg}"))
+                }
+                RouterError::ClientError(msg)
+                    if local_agent_was_attempted
+                        && msg.eq_ignore_ascii_case("unknown provider selector: nvidia") =>
+                {
+                    (
+                        503,
+                        "all local OCR agents failed and no cloud vision provider is configured"
+                            .to_string(),
+                    )
                 }
                 RouterError::ClientError(msg) => (400, msg.clone()),
             };
@@ -255,6 +443,27 @@ pub async fn license_plate_ocr(
             }
         }
     }
+}
+
+async fn record_ocr_usage(
+    state: &crate::state::AppState,
+    auth_id: &str,
+    outcome: &CompletionOutcome,
+    started: std::time::Instant,
+    status: i64,
+) {
+    let _ = state
+        .db
+        .insert_usage(
+            auth_id,
+            &outcome.model,
+            &outcome.provider_id,
+            outcome.response.usage.prompt_tokens,
+            outcome.response.usage.completion_tokens,
+            started.elapsed().as_millis() as i64,
+            status,
+        )
+        .await;
 }
 
 fn record_ocr_sample_background(
@@ -739,12 +948,16 @@ fn is_plausible_plate(plate: &str) -> bool {
 
 fn extract_plate_fallback(text: &str) -> String {
     let plate_regex = regex::Regex::new(r"(?i)\b([A-Z]{1,2})\s*([0-9]{1,4})\s*([A-Z]{1,3})\b").ok();
-    if let Some(re) = plate_regex {
-        if let Some(caps) = re.captures(text) {
-            if let (Some(c1), Some(c2), Some(c3)) = (caps.get(1), caps.get(2), caps.get(3)) {
-                return format!("{} {} {}", c1.as_str().to_uppercase(), c2.as_str(), c3.as_str().to_uppercase());
-            }
-        }
+    if let Some(re) = plate_regex
+        && let Some(caps) = re.captures(text)
+        && let (Some(c1), Some(c2), Some(c3)) = (caps.get(1), caps.get(2), caps.get(3))
+    {
+        return format!(
+            "{} {} {}",
+            c1.as_str().to_uppercase(),
+            c2.as_str(),
+            c3.as_str().to_uppercase()
+        );
     }
 
     for line in text.lines() {
@@ -819,6 +1032,68 @@ mod tests {
         assert!(is_plausible_plate("B 1234 ABC"));
         assert!(is_plausible_plate("BK6453AMB"));
         assert!(is_plausible_plate("D 12 A"));
+    }
+
+    #[test]
+    fn default_local_ocr_priority_uses_requested_agent_models() {
+        let req = LicensePlateOcrRequest {
+            image: "data:image/jpeg;base64,abc".to_string(),
+            model: None,
+            provider: None,
+            instruction: None,
+            for_train: None,
+        };
+        assert_eq!(
+            local_ocr_agent_plan(&req),
+            vec![
+                LocalOcrAttempt {
+                    provider: "agy",
+                    model: "gemini-3.5-flash".to_string(),
+                },
+                LocalOcrAttempt {
+                    provider: "claude",
+                    model: "haiku".to_string(),
+                },
+                LocalOcrAttempt {
+                    provider: "codex",
+                    model: "gpt-5.5".to_string(),
+                },
+                LocalOcrAttempt {
+                    provider: "opencode",
+                    model: "opencode/x-preview-f-free".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_cloud_provider_skips_local_ocr_chain() {
+        let req = LicensePlateOcrRequest {
+            image: "data:image/jpeg;base64,abc".to_string(),
+            model: None,
+            provider: Some("nvidia".to_string()),
+            instruction: None,
+            for_train: None,
+        };
+        assert!(local_ocr_agent_plan(&req).is_empty());
+    }
+
+    #[test]
+    fn explicit_local_ocr_provider_can_override_its_model() {
+        let req = LicensePlateOcrRequest {
+            image: "data:image/jpeg;base64,abc".to_string(),
+            model: Some("custom-vision-model".to_string()),
+            provider: Some("claude-code".to_string()),
+            instruction: None,
+            for_train: None,
+        };
+        assert_eq!(
+            local_ocr_agent_plan(&req),
+            vec![LocalOcrAttempt {
+                provider: "claude",
+                model: "custom-vision-model".to_string(),
+            }]
+        );
     }
 
     #[test]

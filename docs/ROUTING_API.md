@@ -40,7 +40,7 @@ The AI Router acts as a high-performance, fault-tolerant gateway that fronts mul
 | `POST` | `/api/v1/chat/completions` | `Bearer <API_KEY>` | Unified OpenAI-compatible chat completion with multi-provider scaling |
 | `POST` | `/api/v1/chat` | `Bearer <API_KEY>` | Unified router endpoint (defaults to `auto` pool including local agents) |
 | `POST` | `/api/v1/ocr/description` | `Bearer <API_KEY>` | Visual description, OCR extraction, and safety tags (aliased at `/api/v1/vision/description`) |
-| `POST` | `/api/v1/ocr/licenseplate` | `Bearer <API_KEY>` | Vehicle License Plate OCR using NVIDIA Multimodal Vision Models |
+| `POST` | `/api/v1/ocr/licenseplate` | `Bearer <API_KEY>` | Vehicle License Plate OCR using local agent priority, cloud vision, and ALPR fallback |
 | `GET` | `/v1/models` / `/api/v1/models` | `Bearer <API_KEY>` | List all active models and provider aliases |
 | `GET` | `/health` | Public | Liveness probe (`200 OK`) |
 | `GET` | `/health/ready` | Public | Readiness probe (database connectivity) |
@@ -154,46 +154,56 @@ The ladders are configurable:
 | `ROUTER_VISION_FALLBACK_MODELS` | Any request containing an image | `google/diffusiongemma-26b-a4b-it,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning,google/gemma-4-31b-it,minimaxai/minimax-m3` |
 
 A request containing an image is only ever offered to vision-capable models and
-providers — the text ladders are not consulted, and local CLI agents (which
-cannot see images) are excluded.
+providers. The license-plate OCR handler has its own local-first chain; other
+vision endpoints retain their normal cloud-first routing.
 
 ---
 
-### Strategy D: Local Agent CLIs as the Final Fallback
+### Strategy D: Local Agent CLIs
 
 When every HTTP key is exhausted, `auto` degrades to the locally installed agent
 CLIs. They are discovered from `PATH` at startup and sorted last in the pool.
 
 | Selector | CLI | Invocation |
 |---|---|---|
-| `opencode` | OpenCode | `run --format json --pure [--model M] <prompt>` |
-| `codex` | Codex CLI | `exec --ephemeral --sandbox read-only --skip-git-repo-check --ignore-user-config --color never [--model M] -` (prompt on stdin) |
-| `claude` | Claude Code | `--print --output-format json --no-session-persistence --system-prompt … --tools "" --permission-mode dontAsk [--model M] <prompt>` |
-| `agy` | Agy CLI | `--sandbox --disable-slash-commands --output-format text [--model M] --print=<prompt>` |
+| `agy` | Agy CLI | `--sandbox --disable-slash-commands --output-format text [--add-dir DIR] [--model M] --print=<prompt>` |
+| `claude` | Claude Code | `--print --output-format json --no-session-persistence --system-prompt … --tools Read --add-dir DIR --permission-mode dontAsk [--model M] <prompt>` |
+| `codex` | Codex CLI | `exec --ephemeral --sandbox read-only --skip-git-repo-check --ignore-user-config --color never [--model M] --image PATH -` (prompt on stdin) |
+| `opencode` | OpenCode | `run <prompt> --format json --pure [--model M] --file PATH` |
 
 Every agent is run non-interactively, sandboxed/read-only where the CLI offers
-it, with tools disabled and slash-command expansion off so message content
-cannot trigger them.
+it, with only the minimum read access needed for image OCR and slash-command
+expansion off so message content cannot trigger unrelated actions.
 
 Because agents are the last resort, `model: "auto"` makes them run on their
 cheapest model rather than whatever the CLI defaults to:
 
 | Variable | Default |
 |---|---|
-| `ROUTER_AGY_MODEL` | `gemini-3.5-flash-low` |
+| `ROUTER_AGY_MODEL` | `gemini-3.5-flash` |
 | `ROUTER_CLAUDE_MODEL` | `haiku` |
-| `ROUTER_CODEX_MODEL` | *(CLI default)* |
+| `ROUTER_CODEX_MODEL` | `gpt-5.5` |
 | `ROUTER_OPENCODE_MODEL` | *(CLI default)* |
 | `ROUTER_OPENCODE_VISION_MODEL` | `opencode/x-preview-f-free` |
-| `ROUTER_CODEX_VISION_MODEL` | *(CLI default)* |
+| `ROUTER_CODEX_VISION_MODEL` | `gpt-5.5` |
 
-**Image attachments.** OpenCode (`--file`) and Codex (`--image`) accept images on
-the command line, so they remain in the pool for vision requests as the final
-fallback after every cloud vision model. The router downloads or base64-decodes
-each image into a temporary directory, passes the file paths to the agent, and
-deletes the directory when the process exits. Agy and Claude Code have no image
-flag and are excluded from image requests outright — answering a vision question
-from an agent that cannot see the image is a hallucination, not a fallback.
+**Image attachments.** OpenCode (`--file`) and Codex (`--image`) receive native
+attachments. Agy and Claude Code receive a read-only `--add-dir` plus the
+materialized image path in the prompt, allowing their agent read tools to
+inspect the image. The router downloads or base64-decodes each image into a
+temporary directory and deletes it when the process exits.
+
+**License-plate OCR priority.** When `provider` and `model` are omitted (or
+`provider: "auto"` / `model: "auto"`), `/api/v1/ocr/licenseplate` tries the
+following local agentic sequence and accepts only a plausible plate read:
+
+1. Agy — `gemini-3.5-flash`
+2. Claude Code — `haiku`
+3. Codex — `gpt-5.5`
+4. OpenCode — `opencode/x-preview-f-free`
+
+If all four fail or return no usable plate, the handler tries the configured
+NVIDIA vision pool and then the local ALPR engine.
 
 Note that `--file` and `--image` are variadic, so the prompt is passed *before*
 them; a prompt placed afterwards is swallowed as another filename.
@@ -440,4 +450,3 @@ curl -X POST http://127.0.0.1:5790/api/v1/ocr/licenseplate \
   }
 }
 ```
-

@@ -359,9 +359,8 @@ impl AiRouter {
             }
 
             // When images are present, only providers that can actually see may
-            // serve the request: vision-capable HTTP endpoints, plus the agent
-            // CLIs that accept image attachments as a last resort. A text-only
-            // endpoint would either 400 or answer about nothing.
+            // serve the request: vision-capable HTTP endpoints, plus local
+            // agents that can inspect the materialized image file.
             let explicitly_named = selector.is_some_and(|value| {
                 provider.id.eq_ignore_ascii_case(value) || provider.name.eq_ignore_ascii_case(value)
             });
@@ -543,10 +542,10 @@ struct LocalAgentSpec {
 
 fn discover_local_agents() -> Vec<LocalAgentSpec> {
     [
-        ("opencode", "OpenCode", ProviderKind::OpenCode),
-        ("codex", "Codex CLI", ProviderKind::Codex),
-        ("claude", "Claude Code", ProviderKind::Claude),
         ("agy", "Agy CLI", ProviderKind::Agy),
+        ("claude", "Claude Code", ProviderKind::Claude),
+        ("codex", "Codex CLI", ProviderKind::Codex),
+        ("opencode", "OpenCode", ProviderKind::OpenCode),
     ]
     .into_iter()
     .filter_map(|(id, name, kind)| {
@@ -744,7 +743,7 @@ fn provider_relevance(provider: &Provider, requested_model: Option<&str>, has_im
         } else if !provider.kind.is_cli() {
             5
         } else {
-            20
+            20 + local_agent_priority(provider.kind)
         }
     } else {
         let Some(model) = requested_model else {
@@ -753,7 +752,7 @@ fn provider_relevance(provider: &Provider, requested_model: Option<&str>, has_im
                 ProviderKind::Groq => 0,
                 ProviderKind::Nvidia => 1,
                 _ if !provider.kind.is_cli() => 2,
-                _ => 10,
+                _ => 10 + local_agent_priority(provider.kind),
             };
         };
         let model_lower = model.to_ascii_lowercase();
@@ -768,8 +767,21 @@ fn provider_relevance(provider: &Provider, requested_model: Option<&str>, has_im
         } else if !provider.kind.is_cli() {
             1
         } else {
-            10
+            10 + local_agent_priority(provider.kind)
         }
+    }
+}
+
+/// Stable fallback order for local agent CLIs. OCR uses this order explicitly;
+/// keeping the same ranking in the general router prevents `auto` from
+/// reordering the agents when it reaches the local fallback pool.
+fn local_agent_priority(kind: ProviderKind) -> u32 {
+    match kind {
+        ProviderKind::Agy => 0,
+        ProviderKind::Claude => 1,
+        ProviderKind::Codex => 2,
+        ProviderKind::OpenCode => 3,
+        _ => 9,
     }
 }
 

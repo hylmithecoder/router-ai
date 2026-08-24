@@ -59,10 +59,13 @@ impl ProviderKind {
         )
     }
 
-    /// Local agents that can be handed image attachments on the command line,
-    /// and so may serve a vision request when every cloud model is exhausted.
+    /// Local agents that can inspect image files for a vision request.
+    ///
+    /// OpenCode and Codex receive native image flags. Agy and Claude Code are
+    /// given a read-only directory and an explicit file path in the prompt so
+    /// their agent tools can inspect the same materialized image.
     pub fn cli_supports_images(self) -> bool {
-        matches!(self, Self::OpenCode | Self::Codex)
+        self.is_cli()
     }
 }
 
@@ -366,8 +369,8 @@ impl Provider {
 
         // Agent CLIs take images as files on disk, so anything the request
         // carries inline or by URL has to be materialized first. The guard
-        // lives here (rather than at the call site) so a text-only agent never
-        // silently answers a vision request about an image it cannot see.
+        // lives here (rather than at the call site) so an agent never silently
+        // answers a vision request about an image it cannot see.
         let image_urls = collect_image_urls(req);
         let _images = if image_urls.is_empty() {
             MaterializedImages::default()
@@ -383,7 +386,7 @@ impl Provider {
         // Claude takes the caller's system messages through its own
         // `--system-prompt`; the others only have the prompt itself.
         let native_system_prompt = matches!(self.kind, ProviderKind::Claude);
-        let prompt = render_prompt(req, !native_system_prompt);
+        let prompt = render_prompt(req, !native_system_prompt, &_images.paths);
         let model = cli_model_argument(self, req);
         let (args, prompt_on_stdin) = self.cli_args(
             model.as_deref(),
@@ -531,10 +534,9 @@ impl Provider {
                 (args, true)
             }
             ProviderKind::Claude => {
-                // Without replacing the system prompt, Claude Code answers as a
-                // repo coding agent ("I can't just return bare JSON…") instead
-                // of serving the request. `--bare` would also be desirable here
-                // but it forces ANTHROPIC_API_KEY auth and breaks OAuth logins.
+                // Claude Code has no local-image attachment flag. Give its
+                // read-only Read tool access to the temporary image directory
+                // and put the exact image path into the prompt.
                 let mut args = vec![
                     "--print".to_string(),
                     "--output-format".to_string(),
@@ -544,10 +546,11 @@ impl Provider {
                     system_prompt.to_string(),
                     "--exclude-dynamic-system-prompt-sections".to_string(),
                     "--tools".to_string(),
-                    "".to_string(),
+                    "Read".to_string(),
                     "--permission-mode".to_string(),
                     "dontAsk".to_string(),
                 ];
+                append_image_directories(&mut args, image_paths);
                 if let Some(model) = model {
                     args.extend(["--model".to_string(), model.to_string()]);
                 }
@@ -558,13 +561,15 @@ impl Provider {
                 // `--print` consumes the next token as its prompt, so every
                 // boolean flag must come first and the prompt must be attached
                 // with `=`. Passing `--print --sandbox <prompt>` makes agy read
-                // "--sandbox" as the prompt and exit 2.
+                // "--sandbox" as the prompt and exit 2. `--add-dir` exposes
+                // materialized OCR images to Agy's read-only agent tools.
                 let mut args = vec![
                     "--sandbox".to_string(),
                     "--disable-slash-commands".to_string(),
                     "--output-format".to_string(),
                     "text".to_string(),
                 ];
+                append_image_directories(&mut args, image_paths);
                 if let Some(model) = model {
                     args.extend(["--model".to_string(), model.to_string()]);
                 }
@@ -602,10 +607,10 @@ fn cheap_cli_model(provider: &Provider, has_images: bool) -> Option<String> {
             "ROUTER_OPENCODE_VISION_MODEL",
             Some("opencode/x-preview-f-free"),
         ),
-        (ProviderKind::Codex, true) => ("ROUTER_CODEX_VISION_MODEL", None),
-        (ProviderKind::Agy, _) => ("ROUTER_AGY_MODEL", Some("gemini-3.5-flash-low")),
+        (ProviderKind::Codex, true) => ("ROUTER_CODEX_VISION_MODEL", Some("gpt-5.5")),
+        (ProviderKind::Agy, _) => ("ROUTER_AGY_MODEL", Some("gemini-3.5-flash")),
         (ProviderKind::Claude, _) => ("ROUTER_CLAUDE_MODEL", Some("haiku")),
-        (ProviderKind::Codex, false) => ("ROUTER_CODEX_MODEL", None),
+        (ProviderKind::Codex, false) => ("ROUTER_CODEX_MODEL", Some("gpt-5.5")),
         (ProviderKind::OpenCode, false) => ("ROUTER_OPENCODE_MODEL", None),
         _ => return None,
     };
@@ -766,7 +771,7 @@ const ROUTER_AGENT_SYSTEM_PROMPT: &str = "You are a completion backend behind an
 ///
 /// When `include_system` is false the caller passes those messages through the
 /// CLI's own system-prompt flag instead.
-fn render_prompt(req: &ChatCompletionRequest, include_system: bool) -> String {
+fn render_prompt(req: &ChatCompletionRequest, include_system: bool, image_paths: &[String]) -> String {
     let mut out = String::from(
         "You are a completion backend behind an AI router API. Answer the request directly and return only the answer. If a specific output format is requested (for example a single JSON object), emit exactly that with no preamble, commentary, or markdown fences. Never edit files, run commands, or ask for interactive permission.\n\n",
     );
@@ -778,6 +783,19 @@ fn render_prompt(req: &ChatCompletionRequest, include_system: bool) -> String {
             out.push_str(&instructions);
             out.push_str("\n\n");
         }
+    }
+
+    if !image_paths.is_empty() {
+        out.push_str("## Image inputs\n");
+        out.push_str(
+            "Inspect every image file below before answering. The files are available read-only; do not modify them.\n",
+        );
+        for path in image_paths {
+            out.push_str("- ");
+            out.push_str(path);
+            out.push('\n');
+        }
+        out.push('\n');
     }
 
     out.push_str("## Request\n");
@@ -794,6 +812,24 @@ fn render_prompt(req: &ChatCompletionRequest, include_system: bool) -> String {
 
     out.push_str("## Your reply\n");
     out
+}
+
+/// Expose temporary image directories to CLIs that inspect files through their
+/// own read-only agent tools rather than a native `--image`/`--file` flag.
+fn append_image_directories(args: &mut Vec<String>, image_paths: &[String]) {
+    let mut directories = Vec::new();
+    for path in image_paths {
+        let Some(directory) = Path::new(path).parent() else {
+            continue;
+        };
+        let directory = directory.to_string_lossy().to_string();
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    for directory in directories {
+        args.extend(["--add-dir".to_string(), directory]);
+    }
 }
 
 /// The request's system messages, joined.
@@ -1010,13 +1046,35 @@ mod tests {
     }
 
     #[test]
-    fn text_only_agents_refuse_image_requests_instead_of_guessing() {
+    fn every_local_agent_can_receive_image_requests() {
         assert!(ProviderKind::OpenCode.cli_supports_images());
         assert!(ProviderKind::Codex.cli_supports_images());
-        // Agy and Claude Code have no image attachment flag; answering a vision
-        // request from them would be a hallucination about an unseen image.
-        assert!(!ProviderKind::Agy.cli_supports_images());
-        assert!(!ProviderKind::Claude.cli_supports_images());
+        assert!(ProviderKind::Agy.cli_supports_images());
+        assert!(ProviderKind::Claude.cli_supports_images());
+    }
+
+    #[test]
+    fn tool_based_image_agents_receive_read_only_image_directory() {
+        for kind in [ProviderKind::Agy, ProviderKind::Claude] {
+            let provider = Provider::new_cli(
+                kind.as_str(),
+                kind.as_str(),
+                kind,
+                kind.as_str(),
+                "default",
+                ".",
+                60,
+            );
+            let (args, _) = provider.cli_args(
+                Some("vision-model"),
+                "inspect image",
+                "system",
+                &["/tmp/router-cli-images-1/image-0.jpg".to_string()],
+            );
+            assert!(args.windows(2).any(|pair| {
+                pair[0] == "--add-dir" && pair[1] == "/tmp/router-cli-images-1"
+            }));
+        }
     }
 
     #[test]
