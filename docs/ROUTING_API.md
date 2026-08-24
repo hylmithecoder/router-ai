@@ -40,7 +40,7 @@ The AI Router acts as a high-performance, fault-tolerant gateway that fronts mul
 | `POST` | `/api/v1/chat/completions` | `Bearer <API_KEY>` | Unified OpenAI-compatible chat completion with multi-provider scaling |
 | `POST` | `/api/v1/chat` | `Bearer <API_KEY>` | Unified router endpoint (defaults to `auto` pool including local agents) |
 | `POST` | `/api/v1/ocr/description` | `Bearer <API_KEY>` | Visual description, OCR extraction, and safety tags (aliased at `/api/v1/vision/description`) |
-| `POST` | `/api/v1/ocr/licenseplate` | `Bearer <API_KEY>` | Vehicle License Plate OCR using local agent priority, cloud vision, and ALPR fallback |
+| `POST` | `/api/v1/ocr/licenseplate` | `Bearer <API_KEY>` | Vehicle License Plate OCR using NVIDIA vision, local agent, and ALPR fallback |
 | `GET` | `/v1/models` / `/api/v1/models` | `Bearer <API_KEY>` | List all active models and provider aliases |
 | `GET` | `/health` | Public | Liveness probe (`200 OK`) |
 | `GET` | `/health/ready` | Public | Readiness probe (database connectivity) |
@@ -154,8 +154,8 @@ The ladders are configurable:
 | `ROUTER_VISION_FALLBACK_MODELS` | Any request containing an image | `google/diffusiongemma-26b-a4b-it,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning,google/gemma-4-31b-it,minimaxai/minimax-m3` |
 
 A request containing an image is only ever offered to vision-capable models and
-providers. The license-plate OCR handler has its own local-first chain; other
-vision endpoints retain their normal cloud-first routing.
+providers. The license-plate OCR handler constrains its first pass to NVIDIA,
+then uses local agents only after that cloud pass is exhausted.
 
 ---
 
@@ -166,7 +166,7 @@ CLIs. They are discovered from `PATH` at startup and sorted last in the pool.
 
 | Selector | CLI | Invocation |
 |---|---|---|
-| `agy` | Agy CLI | `--sandbox --disable-slash-commands --output-format text [--add-dir DIR] [--model M] --print=<prompt>` |
+| `agy` | Agy CLI | `--sandbox --disable-slash-commands --output-format text [--add-dir DIR] [--model M] --effort E --print=<prompt>` |
 | `claude` | Claude Code | `--print --output-format json --no-session-persistence --system-prompt … --tools Read --add-dir DIR --permission-mode dontAsk [--model M] <prompt>` |
 | `codex` | Codex CLI | `exec --ephemeral --sandbox read-only --skip-git-repo-check --ignore-user-config --color never [--model M] --image PATH -` (prompt on stdin) |
 | `opencode` | OpenCode | `run <prompt> --format json --pure [--model M] --file PATH` |
@@ -181,6 +181,7 @@ cheapest model rather than whatever the CLI defaults to:
 | Variable | Default |
 |---|---|
 | `ROUTER_AGY_MODEL` | `gemini-3.5-flash` |
+| `ROUTER_AGY_EFFORT` | `low` |
 | `ROUTER_CLAUDE_MODEL` | `haiku` |
 | `ROUTER_CODEX_MODEL` | `gpt-5.5` |
 | `ROUTER_OPENCODE_MODEL` | *(CLI default)* |
@@ -194,16 +195,18 @@ inspect the image. The router downloads or base64-decodes each image into a
 temporary directory and deletes it when the process exits.
 
 **License-plate OCR priority.** When `provider` and `model` are omitted (or
-`provider: "auto"` / `model: "auto"`), `/api/v1/ocr/licenseplate` tries the
-following local agentic sequence and accepts only a plausible plate read:
+`provider: "auto"` / `model: "auto"`), `/api/v1/ocr/licenseplate` first tries
+the configured NVIDIA API pool, including its key/model failover on upstream
+errors. Only if that cloud pass fails or returns no plausible plate does it try:
 
 1. Agy — `gemini-3.5-flash`
 2. Claude Code — `haiku`
 3. Codex — `gpt-5.5`
 4. OpenCode — `opencode/x-preview-f-free`
 
-If all four fail or return no usable plate, the handler tries the configured
-NVIDIA vision pool and then the local ALPR engine.
+If all four fail or return no usable plate, the handler finally tries the local
+ALPR engine. An explicit local provider selector bypasses NVIDIA and targets
+that one agent directly.
 
 Note that `--file` and `--image` are variadic, so the prompt is passed *before*
 them; a prompt placed afterwards is swallowed as another filename.

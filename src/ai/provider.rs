@@ -573,11 +573,24 @@ impl Provider {
                 if let Some(model) = model {
                     args.extend(["--model".to_string(), model.to_string()]);
                 }
+                args.extend(["--effort".to_string(), agy_effort()]);
                 args.push(format!("--print={prompt}"));
                 (args, false)
             }
             ProviderKind::Groq | ProviderKind::Nvidia => (vec![prompt.to_string()], false),
         }
+    }
+}
+
+fn agy_effort() -> String {
+    normalize_agy_effort(std::env::var("ROUTER_AGY_EFFORT").ok().as_deref()).to_string()
+}
+
+fn normalize_agy_effort(value: Option<&str>) -> &'static str {
+    match value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("medium") => "medium",
+        Some(value) if value.eq_ignore_ascii_case("high") => "high",
+        _ => "low",
     }
 }
 
@@ -1075,6 +1088,29 @@ mod tests {
                 pair[0] == "--add-dir" && pair[1] == "/tmp/router-cli-images-1"
             }));
         }
+    }
+
+    #[test]
+    fn agy_flash_model_always_receives_a_valid_effort() {
+        let provider = Provider::new_cli(
+            "agy",
+            "Agy CLI",
+            ProviderKind::Agy,
+            "agy",
+            "default",
+            ".",
+            60,
+        );
+        let (args, _) = provider.cli_args(Some("gemini-3.5-flash"), "inspect image", "system", &[]);
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == "gemini-3.5-flash")
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--effort" && matches!(pair[1].as_str(), "low" | "medium" | "high")
+        }));
+        assert_eq!(normalize_agy_effort(Some("invalid")), "low");
     }
 
     #[test]

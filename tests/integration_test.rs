@@ -1023,7 +1023,6 @@ async fn license_plate_ocr_successful_recognition() {
                     json!({
                         "image": "data:image/jpeg;base64,fakeimagebytes",
                         "instruction": "Tolong baca plat nomor mobil ini",
-                        "provider": "nvidia",
                         "fortrain": true
                     })
                     .to_string(),
@@ -1079,7 +1078,6 @@ async fn license_plate_ocr_skips_dataset_harvesting_when_not_for_train() {
                 .body(Body::from(
                     json!({
                         "image": "data:image/jpeg;base64,fakeimagebytes",
-                        "provider": "nvidia",
                         "fortrain": false
                     })
                     .to_string(),
@@ -1146,7 +1144,6 @@ async fn license_plate_ocr_supports_model_selection_and_auto_pick() {
                     .body(Body::from(
                         json!({
                             "image": "https://example.com/plate.jpg",
-                            "provider": "nvidia",
                             "model": model
                         })
                         .to_string(),

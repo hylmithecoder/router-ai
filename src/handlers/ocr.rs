@@ -28,9 +28,8 @@ pub const SUPPORTED_VISION_MODELS: &[&str] = &[
 
 pub const DEFAULT_OCR_MODEL: &str = "google/diffusiongemma-26b-a4b-it";
 
-/// Local agentic OCR order. Each CLI is invoked with a model that is known to
-/// be useful for visual OCR, then the handler falls through to cloud vision
-/// and the deterministic local ALPR engine if no agent returns a usable plate.
+/// Local agentic OCR fallback order. NVIDIA vision is always attempted first
+/// unless the caller explicitly selects one of these local providers.
 const LOCAL_OCR_AGENT_ORDER: &[(&str, &str)] = &[
     ("agy", "gemini-3.5-flash"),
     ("claude", "haiku"),
@@ -44,28 +43,10 @@ struct LocalOcrAttempt {
     model: String,
 }
 
-/// Select the local agentic OCR chain for the default route, or one explicit
-/// local provider when the caller asks for it. Explicit cloud providers keep
-/// their existing behavior and skip this chain.
+/// Select one explicitly requested local provider, or the complete local
+/// fallback chain that runs only after cloud vision has been exhausted.
 fn local_ocr_agent_plan(req: &LicensePlateOcrRequest) -> Vec<LocalOcrAttempt> {
-    let requested_provider = req
-        .provider
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let provider_is_auto = requested_provider
-        .map(|value| value.eq_ignore_ascii_case("auto"))
-        .unwrap_or(true);
-
-    let provider = if provider_is_auto {
-        req.model
-            .as_deref()
-            .and_then(canonical_local_provider)
-    } else {
-        canonical_local_provider(requested_provider.unwrap_or_default())
-    };
-
-    if let Some(provider) = provider {
+    if let Some(provider) = requested_local_ocr_provider(req) {
         let model = req
             .model
             .as_deref()
@@ -76,25 +57,45 @@ fn local_ocr_agent_plan(req: &LicensePlateOcrRequest) -> Vec<LocalOcrAttempt> {
         return vec![LocalOcrAttempt { provider, model }];
     }
 
-    let model_is_auto = req
-        .model
-        .as_deref()
-        .map(|value| {
-            let value = value.trim();
-            value.is_empty() || value.eq_ignore_ascii_case("auto")
+    LOCAL_OCR_AGENT_ORDER
+        .iter()
+        .map(|(provider, model)| LocalOcrAttempt {
+            provider,
+            model: (*model).to_string(),
         })
-        .unwrap_or(true);
-    if provider_is_auto && model_is_auto {
-        return LOCAL_OCR_AGENT_ORDER
-            .iter()
-            .map(|(provider, model)| LocalOcrAttempt {
-                provider,
-                model: (*model).to_string(),
-            })
-            .collect();
-    }
+        .collect()
+}
 
-    Vec::new()
+/// An explicit local selector bypasses NVIDIA. With an automatic or absent
+/// provider, a local model alias is also treated as an explicit selector.
+fn requested_local_ocr_provider(req: &LicensePlateOcrRequest) -> Option<&'static str> {
+    let requested_provider = req
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match requested_provider {
+        Some(provider)
+            if !provider.eq_ignore_ascii_case("auto") && !provider.eq_ignore_ascii_case("all") =>
+        {
+            canonical_local_provider(provider)
+        }
+        _ => req.model.as_deref().and_then(canonical_local_provider),
+    }
+}
+
+fn cloud_ocr_provider(req: &LicensePlateOcrRequest) -> String {
+    req.provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| {
+            !provider.is_empty()
+                && !provider.eq_ignore_ascii_case("auto")
+                && !provider.eq_ignore_ascii_case("all")
+        })
+        .unwrap_or("nvidia")
+        .to_string()
 }
 
 fn canonical_local_provider(value: &str) -> Option<&'static str> {
@@ -223,9 +224,8 @@ fn datasets_dir() -> std::path::PathBuf {
 /// `POST /api/v1/ocr/licenseplate`
 ///
 /// Recognizes and extracts vehicle license plate details from an image.
-/// By default it tries local agentic OCR in priority order, then cloud vision
-/// and the deterministic ALPR fallback; explicit provider/model overrides are
-/// respected.
+/// By default it exhausts NVIDIA cloud vision first, then tries local agentic
+/// OCR in priority order and finally the deterministic ALPR fallback.
 pub async fn license_plate_ocr(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthKey>,
@@ -257,13 +257,90 @@ pub async fn license_plate_ocr(
     let image_url = prepare_image_for_upstream(&state.http, image_input).await;
     let prompt = build_ocr_prompt(req.instruction.as_deref());
 
-    // OCR defaults to the local agentic chain requested by the operator. A
-    // model/provider override can still target one local agent or the cloud
-    // path directly. A successful process is not enough: only a plausible
-    // plate read wins, so a text-only apology or malformed JSON falls through
-    // to the next agent.
+    let explicit_local_provider = requested_local_ocr_provider(&req);
     let local_ocr_plan = local_ocr_agent_plan(&req);
-    let local_agent_was_attempted = !local_ocr_plan.is_empty();
+
+    // The normal route is deliberately constrained to NVIDIA so the generic
+    // image router cannot select a local CLI before the cloud pool is truly
+    // exhausted. Explicit local selectors skip this pass.
+    let target_model = state
+        .router
+        .resolve_vision_model(if is_fast_local {
+            None
+        } else {
+            req.model.as_deref()
+        })
+        .await;
+    let mut unusable_cloud_result: Option<(CompletionOutcome, LicensePlateData)> = None;
+    let mut cloud_failure: Option<(i64, String)> = None;
+
+    if explicit_local_provider.is_none() {
+        let cloud_provider = cloud_ocr_provider(&req);
+        let cloud_req = build_ocr_chat_request(
+            image_url.clone(),
+            prompt.clone(),
+            target_model.clone(),
+            Some(cloud_provider.clone()),
+        );
+
+        match state.router.complete(&cloud_req).await {
+            Ok(outcome) => {
+                let content = outcome
+                    .response
+                    .choices
+                    .first()
+                    .map(|choice| choice.message.content.as_text())
+                    .unwrap_or_default();
+                let data =
+                    parse_license_plate_output(&content, &outcome.model, &outcome.provider_name);
+
+                if is_plausible_plate(&data.plate_number) {
+                    return Ok(finish_ocr_outcome(
+                        &state,
+                        &auth.id,
+                        image_input,
+                        for_train,
+                        "cloud",
+                        (outcome, data),
+                        started,
+                    )
+                    .await);
+                }
+
+                tracing::warn!(
+                    provider = %outcome.provider_id,
+                    model = %outcome.model,
+                    "NVIDIA OCR returned no plausible license plate; falling back to local agents"
+                );
+                unusable_cloud_result = Some((outcome, data));
+            }
+            Err(err) => {
+                let (status, message) = match &err {
+                    RouterError::NoProviders => (503, "no providers configured".to_string()),
+                    RouterError::AllProvidersFailed(message) => {
+                        (503, format!("all providers failed: {message}"))
+                    }
+                    RouterError::ClientError(message)
+                        if cloud_provider.eq_ignore_ascii_case("nvidia")
+                            && message
+                                .eq_ignore_ascii_case("unknown provider selector: nvidia") =>
+                    {
+                        (503, "no NVIDIA vision provider is configured".to_string())
+                    }
+                    RouterError::ClientError(message) => (400, message.clone()),
+                };
+                tracing::warn!(
+                    provider = %cloud_provider,
+                    error = ?err,
+                    "cloud OCR exhausted; falling back to local agents"
+                );
+                cloud_failure = Some((status, message));
+            }
+        }
+    }
+
+    // A successful process is not enough: only a plausible plate read wins,
+    // so a text-only apology or malformed JSON falls through to the next agent.
     for attempt in &local_ocr_plan {
         let local_req = build_ocr_chat_request(
             image_url.clone(),
@@ -279,11 +356,8 @@ pub async fn license_plate_ocr(
                     .first()
                     .map(|choice| choice.message.content.as_text())
                     .unwrap_or_default();
-                let data = parse_license_plate_output(
-                    &content,
-                    &outcome.model,
-                    &outcome.provider_name,
-                );
+                let data =
+                    parse_license_plate_output(&content, &outcome.model, &outcome.provider_name);
 
                 if !is_plausible_plate(&data.plate_number) {
                     tracing::warn!(
@@ -294,29 +368,16 @@ pub async fn license_plate_ocr(
                     continue;
                 }
 
-                if for_train {
-                    record_ocr_sample_background(
-                        state.db.clone(),
-                        state.http.clone(),
-                        image_input.to_string(),
-                        data.clone(),
-                        "agentic",
-                    );
-                }
-                record_ocr_usage(
+                return Ok(finish_ocr_outcome(
                     &state,
                     &auth.id,
-                    &outcome,
+                    image_input,
+                    for_train,
+                    "agentic",
+                    (outcome, data),
                     started,
-                    StatusCode::OK.as_u16() as i64,
                 )
-                .await;
-
-                return Ok(Json(LicensePlateOcrResponse {
-                    success: true,
-                    data,
-                    usage: outcome.response.usage,
-                }));
+                .await);
             }
             Err(err) => {
                 tracing::warn!(
@@ -329,120 +390,87 @@ pub async fn license_plate_ocr(
         }
     }
 
-    // Auto-pick active vision model or use requested model
-    let target_model = state
-        .router
-        .resolve_vision_model(req.model.as_deref())
+    // The deterministic ALPR service is the final fallback after both cloud
+    // and agentic vision paths have failed to produce a usable plate.
+    match try_local_alpr_fallback(&state, image_input, &auth.id, started, false, for_train).await {
+        Ok(response) => return Ok(Json(response)),
+        Err(error) => tracing::warn!(%error, "final local ALPR fallback failed"),
+    }
+
+    // Preserve the established 200 response contract if NVIDIA did answer but
+    // none of the accuracy fallbacks could improve its unusable read.
+    if let Some((outcome, data)) = unusable_cloud_result {
+        return Ok(finish_ocr_outcome(
+            &state,
+            &auth.id,
+            image_input,
+            for_train,
+            "cloud",
+            (outcome, data),
+            started,
+        )
+        .await);
+    }
+
+    let (status, message) = cloud_failure.unwrap_or_else(|| {
+        (
+            503,
+            "the requested local OCR provider and local ALPR engine failed".to_string(),
+        )
+    });
+    let _ = state
+        .db
+        .insert_usage(
+            &auth.id,
+            &target_model,
+            "none",
+            0,
+            0,
+            started.elapsed().as_millis() as i64,
+            status,
+        )
         .await;
 
-    // Do not repeat the local chain after it has already been exhausted. The
-    // cloud pass is intentionally constrained to NVIDIA's vision pool.
-    let cloud_provider = if local_agent_was_attempted {
-        Some("nvidia".to_string())
+    if status == 503 {
+        Err(AppError::UpstreamUnavailable(message))
     } else {
-        req.provider.clone()
-    };
-    let chat_req = build_ocr_chat_request(image_url, prompt, target_model.clone(), cloud_provider);
-
-    match state.router.complete(&chat_req).await {
-        Ok(outcome) => {
-            let content = outcome
-                .response
-                .choices
-                .first()
-                .map(|c| c.message.content.as_text())
-                .unwrap_or_default();
-
-            let data = parse_license_plate_output(
-                &content,
-                &outcome.model,
-                &outcome.provider_name,
-            );
-
-            // A 200 from the vision model is not the same as a usable read: it
-            // regularly returns an empty or malformed plate. Retry locally so
-            // the local engine acts as an accuracy safety net, not just an
-            // outage fallback, and keep whichever answer actually parses.
-            if !is_plausible_plate(&data.plate_number)
-                && let Ok(local) =
-                    try_local_alpr_fallback(&state, image_input, &auth.id, started, false, for_train).await
-            {
-                return Ok(Json(local));
-            }
-
-            // Asynchronously harvest dataset sample for training & continuous evaluation if requested
-            if for_train {
-                record_ocr_sample_background(
-                    state.db.clone(),
-                    state.http.clone(),
-                    image_input.to_string(),
-                    data.clone(),
-                    "cloud",
-                );
-            }
-
-            record_ocr_usage(
-                &state,
-                &auth.id,
-                &outcome,
-                started,
-                StatusCode::OK.as_u16() as i64,
-            )
-            .await;
-
-            Ok(Json(LicensePlateOcrResponse {
-                success: true,
-                data,
-                usage: outcome.response.usage,
-            }))
-        }
-        Err(err) => {
-            let (status, message) = match &err {
-                RouterError::NoProviders => (503, "no providers configured".to_string()),
-                RouterError::AllProvidersFailed(msg) => {
-                    (503, format!("all providers failed: {msg}"))
-                }
-                RouterError::ClientError(msg)
-                    if local_agent_was_attempted
-                        && msg.eq_ignore_ascii_case("unknown provider selector: nvidia") =>
-                {
-                    (
-                        503,
-                        "all local OCR agents failed and no cloud vision provider is configured"
-                            .to_string(),
-                    )
-                }
-                RouterError::ClientError(msg) => (400, msg.clone()),
-            };
-
-            // Attempt seamless fallback to Local ALPR Engine when upstream providers are down
-            if status == 503
-                && let Ok(fallback_resp) =
-                    try_local_alpr_fallback(&state, image_input, &auth.id, started, false, for_train).await
-            {
-                return Ok(Json(fallback_resp));
-            }
-
-            let _ = state
-                .db
-                .insert_usage(
-                    &auth.id,
-                    &target_model,
-                    "none",
-                    0,
-                    0,
-                    started.elapsed().as_millis() as i64,
-                    status as i64,
-                )
-                .await;
-
-            if status == 503 {
-                Err(AppError::UpstreamUnavailable(message))
-            } else {
-                Err(AppError::BadRequest(message))
-            }
-        }
+        Err(AppError::BadRequest(message))
     }
+}
+
+async fn finish_ocr_outcome(
+    state: &crate::state::AppState,
+    auth_id: &str,
+    image_input: &str,
+    for_train: bool,
+    source: &'static str,
+    result: (CompletionOutcome, LicensePlateData),
+    started: std::time::Instant,
+) -> Json<LicensePlateOcrResponse> {
+    let (outcome, data) = result;
+    if for_train {
+        record_ocr_sample_background(
+            state.db.clone(),
+            state.http.clone(),
+            image_input.to_string(),
+            data.clone(),
+            source,
+        );
+    }
+    record_ocr_usage(
+        state,
+        auth_id,
+        &outcome,
+        started,
+        StatusCode::OK.as_u16() as i64,
+    )
+    .await;
+
+    Json(LicensePlateOcrResponse {
+        success: true,
+        data,
+        usage: outcome.response.usage,
+    })
 }
 
 async fn record_ocr_usage(
@@ -1035,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn default_local_ocr_priority_uses_requested_agent_models() {
+    fn cloud_fallback_uses_local_agents_in_requested_priority() {
         let req = LicensePlateOcrRequest {
             image: "data:image/jpeg;base64,abc".to_string(),
             model: None,
@@ -1067,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cloud_provider_skips_local_ocr_chain() {
+    fn explicit_nvidia_provider_still_has_local_ocr_fallbacks() {
         let req = LicensePlateOcrRequest {
             image: "data:image/jpeg;base64,abc".to_string(),
             model: None,
@@ -1075,7 +1103,8 @@ mod tests {
             instruction: None,
             for_train: None,
         };
-        assert!(local_ocr_agent_plan(&req).is_empty());
+        assert_eq!(local_ocr_agent_plan(&req).len(), 4);
+        assert!(requested_local_ocr_provider(&req).is_none());
     }
 
     #[test]
@@ -1094,6 +1123,7 @@ mod tests {
                 model: "custom-vision-model".to_string(),
             }]
         );
+        assert_eq!(requested_local_ocr_provider(&req), Some("claude"));
     }
 
     #[test]
